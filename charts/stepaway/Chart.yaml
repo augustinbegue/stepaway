@@ -1,0 +1,15 @@
+apiVersion: v2
+name: stepaway
+description: Hand off a live Claude Code session between machines via a k8s-backed runner.
+type: application
+version: 0.1.0
+appVersion: "0.3.0"
+home: https://stepaway.dev
+sources:
+  - https://github.com/augustinbegue/stepaway
+keywords:
+  - claude-code
+  - dev-environments
+  - session-handoff
+annotations:
+  licenses: AGPL-3.0

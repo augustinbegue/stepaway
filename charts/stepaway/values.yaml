@@ -1,0 +1,154 @@
+# Default values for the stepaway chart.
+# See README.md for the full values reference.
+
+# -- Number of backend replicas. The backend is stateful-ish (in-memory
+# session bookkeeping is backed by k8s objects), keep this at 1 unless you
+# know what you're doing.
+replicaCount: 1
+
+image:
+  # -- Backend container image repository.
+  repository: ghcr.io/augustinbegue/stepaway-server
+  pullPolicy: IfNotPresent
+  # -- Backend image tag. Defaults to the chart's appVersion when empty.
+  tag: ""
+
+imagePullSecrets: []
+
+# -- Extra labels applied to every object this chart renders, in addition to
+# the standard app.kubernetes.io/* labels and app.kubernetes.io/part-of: stepaway.
+extraLabels: {}
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  # -- Whether to create a ServiceAccount for the backend. The backend needs
+  # this identity to create/manage session pods via the k8s API.
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podSecurityContext: {}
+securityContext: {}
+
+service:
+  type: ClusterIP
+  # -- Service port. Always proxies to the backend's PORT 8080.
+  port: 80
+
+resources:
+  # -- Resources for the backend Deployment. Left empty by default; set
+  # explicit requests/limits before running this in a resource-constrained
+  # cluster.
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# -- Extra environment variables merged into the backend container, after the
+# ones this chart sets (STEPAWAY_TOKEN, PORT, RUNNER_*). Use for things like
+# log level.
+extraEnv: []
+
+probes:
+  # -- Path used for both liveness and readiness probes.
+  path: /v1/healthz
+  liveness:
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    failureThreshold: 3
+  readiness:
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    failureThreshold: 3
+
+auth:
+  # -- Hard-set the bearer token instead of letting the chart generate one.
+  # NOT RECOMMENDED: prefer the auto-generated token (see NOTES.txt after
+  # install for how to read it). Only useful for GitOps setups that need a
+  # deterministic value.
+  token: ""
+  # -- Force regeneration of the bearer token on the next `helm upgrade`.
+  # Normally the chart preserves the existing token across upgrades so
+  # already-authenticated CLIs keep working.
+  regenerateToken: false
+
+ingress:
+  # -- Expose the backend outside the cluster. Off by default: most
+  # installs are reached via `kubectl port-forward` or an internal mesh.
+  enabled: false
+  className: ""
+  annotations: {}
+  host: stepaway.example.com
+  tls:
+    # -- Name of a pre-existing TLS Secret in this namespace. Leave empty to
+    # serve the Ingress without TLS.
+    secretName: ""
+
+# -- Values consumed by the backend and passed straight through as
+# RUNNER_* environment variables. The backend uses these as defaults when it
+# builds the per-session runner pod template; they are not rendered into any
+# object owned by this chart (no CRDs, no operator — session pods are
+# created imperatively by the backend).
+runner:
+  # Boot-installs claude/bun/compose at start (~60-90s). The prebaked
+  # ghcr.io/augustinbegue/stepaway-runner template image replaces this once
+  # published (P6: ~1s cold start).
+  image: node:22-bookworm-slim
+  resources:
+    cpuRequest: 250m
+    memRequest: 512Mi
+    memLimit: 2Gi
+  storageClass: ""
+  pvc:
+    size: 5Gi
+  dind:
+    enabled: true
+
+# -- Opt-in governance for session (runner) pods. Everything here is
+# disabled by default so a fresh install behaves like the v0.1 PoC: no
+# quotas, no LimitRange, no NetworkPolicy.
+quotas:
+  enabled: false
+  # -- Max number of pods (backend + runners) counted by this ResourceQuota.
+  maxPods: "10"
+  # -- Max number of PersistentVolumeClaims in the namespace.
+  maxPVCs: "10"
+  requests:
+    cpu: "4"
+    memory: 8Gi
+
+limitRange:
+  enabled: false
+  # -- Applied to containers in runner pods that don't set their own
+  # requests/limits.
+  default:
+    cpu: 500m
+    memory: 1Gi
+  defaultRequest:
+    cpu: 250m
+    memory: 512Mi
+  # -- Hard ceiling any runner container may request/limit to.
+  max:
+    cpu: "4"
+    memory: 8Gi
+
+networkPolicy:
+  # -- Deny-by-default ingress for runner pods (only the backend may reach
+  # them) plus an open-ingress policy for the backend itself. WARNING: many
+  # CNIs (e.g. flannel without a policy engine) silently no-op
+  # NetworkPolicy objects — verify enforcement before relying on this for
+  # isolation. See README.md.
+  enabled: false
+  # -- Egress rules for runner pods, passed through verbatim into the
+  # NetworkPolicy spec.egress list. Empty means "egress open" (no egress
+  # rule is added, so the policy only restricts ingress). Example to
+  # restrict runners to DNS + private ranges is documented in README.md.
+  runnerEgress: []

@@ -1,0 +1,50 @@
+{{- if .Values.serviceAccount.create }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "stepaway.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "stepaway.labels" . | nindent 4 }}
+rules:
+  # Session runner pods: full lifecycle, namespace-scoped only.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "create", "delete", "patch"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    # "get" is required for WebSocket exec (GET + upgrade); "create" covers the
+    # SPDY POST path. Without "get" the backend's exec silently 403s.
+    verbs: ["get", "create"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  # Per-session workspace storage.
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "create", "delete"]
+  # Auth/env-carry secrets minted per session (stepaway-auth pattern).
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create", "patch"]
+  # Surfacing session lifecycle to `kubectl describe` / `stepaway status`.
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "stepaway.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "stepaway.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "stepaway.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "stepaway.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

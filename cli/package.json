@@ -1,0 +1,28 @@
+{
+  "name": "stepaway",
+  "version": "0.3.0",
+  "description": "Move a live Claude Code session between your laptop and a runner pod on your own cluster.",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "bin": {
+    "stepaway": "./dist/stepaway.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "dist/",
+    "skill/",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "bun build src/stepaway.ts --target=node --outfile=dist/stepaway.js",
+    "prepack": "bun run build",
+    "test:e2e": "bun run test/e2e-mock.ts"
+  },
+  "devDependencies": {
+    "@clack/prompts": "^1.7.0",
+    "@stepaway/core": "workspace:*",
+    "picocolors": "^1.1.1"
+  }
+}

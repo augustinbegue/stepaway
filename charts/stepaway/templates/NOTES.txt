@@ -1,0 +1,51 @@
+stepaway is installed.
+
+1. Read the bearer token the CLI needs to authenticate:
+
+   kubectl get secret {{ include "stepaway.authSecretName" . }} -n {{ .Release.Namespace }} -o jsonpath='{.data.token}' | base64 -d; echo
+
+2. Reach the backend:
+
+{{- if .Values.ingress.enabled }}
+
+   It's exposed via Ingress at:
+
+     https://{{ .Values.ingress.host }}
+{{- else }}
+
+   No Ingress is configured (ingress.enabled=false). Port-forward instead:
+
+     kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "stepaway.fullname" . }} 8080:{{ .Values.service.port }}
+
+   The backend is then reachable at http://localhost:8080.
+{{- end }}
+
+3. Quickstart from your laptop:
+
+   npm i -g @stepaway/cli
+   stepaway auth --server {{ if .Values.ingress.enabled }}https://{{ .Values.ingress.host }}{{ else }}http://localhost:8080{{ end }} --server-token <token from step 1>
+   stepaway push
+
+{{- if .Values.networkPolicy.enabled }}
+
+WARNING: networkPolicy.enabled=true rendered two NetworkPolicy objects
+(runner ingress lockdown + backend policy). Many CNIs (e.g. flannel without
+a policy engine such as Calico/Cilium) accept NetworkPolicy objects but do
+not enforce them — verify your cluster's CNI actually enforces
+NetworkPolicy before relying on this for isolation between sessions.
+{{- end }}
+
+{{- if or .Values.quotas.enabled .Values.limitRange.enabled }}
+
+Governance enabled:
+{{- if .Values.quotas.enabled }}
+  - ResourceQuota: max {{ .Values.quotas.maxPods }} pods, {{ .Values.quotas.maxPVCs }} PVCs, {{ .Values.quotas.requests.cpu }} cpu / {{ .Values.quotas.requests.memory }} mem requested in this namespace.
+{{- end }}
+{{- if .Values.limitRange.enabled }}
+  - LimitRange: runner containers default to {{ .Values.limitRange.defaultRequest.cpu }}/{{ .Values.limitRange.defaultRequest.memory }} requests, capped at {{ .Values.limitRange.max.cpu }}/{{ .Values.limitRange.max.memory }}.
+{{- end }}
+{{- end }}
+
+Rotate the bearer token with:
+
+  helm upgrade {{ .Release.Name }} stepaway/stepaway -n {{ .Release.Namespace }} --reuse-values --set auth.regenerateToken=true

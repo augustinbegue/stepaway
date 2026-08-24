@@ -1,0 +1,53 @@
+{{- if .Values.networkPolicy.enabled }}
+# Runner pods: deny all ingress except from the backend pod. Egress is open
+# by default; restrict it via .Values.networkPolicy.runnerEgress.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "stepaway.fullname" . }}-runner
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "stepaway.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: stepaway-runner
+  policyTypes:
+    - Ingress
+    {{- if .Values.networkPolicy.runnerEgress }}
+    - Egress
+    {{- end }}
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "stepaway.selectorLabels" . | nindent 14 }}
+  {{- if .Values.networkPolicy.runnerEgress }}
+  egress:
+    {{- toYaml .Values.networkPolicy.runnerEgress | nindent 4 }}
+  {{- end }}
+---
+# Backend pod: ingress open (it sits behind the Service/Ingress and needs to
+# be reachable), egress open (it talks to the k8s API and DNS; we don't try
+# to enumerate the apiserver's address here).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "stepaway.fullname" . }}-backend
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "stepaway.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "stepaway.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    - {}
+{{- end }}

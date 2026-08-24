@@ -1,0 +1,15 @@
+{{- if .Values.quotas.enabled }}
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: {{ include "stepaway.fullname" . }}-quota
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "stepaway.labels" . | nindent 4 }}
+spec:
+  hard:
+    pods: {{ .Values.quotas.maxPods | quote }}
+    persistentvolumeclaims: {{ .Values.quotas.maxPVCs | quote }}
+    requests.cpu: {{ .Values.quotas.requests.cpu | quote }}
+    requests.memory: {{ .Values.quotas.requests.memory | quote }}
+{{- end }}

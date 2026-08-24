@@ -1,0 +1,17 @@
+{
+  "name": "@stepaway/core",
+  "version": "0.3.0",
+  "description": "Pure shared logic for stepaway: transcript reader, manifest/config types, podspec template, capture/restore scripts.",
+  "license": "AGPL-3.0-only",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "module": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src/"
+  ]
+}

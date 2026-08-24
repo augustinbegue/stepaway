@@ -1,0 +1,21 @@
+{
+  "name": "stepaway-monorepo",
+  "private": true,
+  "version": "0.3.0",
+  "description": "stepaway monorepo — packages/core (shared pure logic), cli/ (laptop client), server/ (in-cluster backend).",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "cli",
+    "server"
+  ],
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2"
+  },
+  "scripts": {
+    "typecheck": "tsc -p packages/core/tsconfig.json && tsc -p cli/tsconfig.json && tsc -p server/tsconfig.json",
+    "test": "bun test server/test"
+  }
+}
