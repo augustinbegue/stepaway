@@ -10,6 +10,7 @@ export const API_PREFIX = "/v1";
 
 /** Server-derived run state — the UI's core field. */
 export type SessionState =
+  | "building" // v1.2: devcontainer env image being built (before the pod exists)
   | "pending" // pod/PVC created, runner still booting
   | "restoring" // capture upload accepted, restore/setup in progress
   | "ready" // runner up, no run launched (or restore finished, run not started)
@@ -36,6 +37,20 @@ export interface CreateSessionRequest {
   options?: {
     /** Remote path base, default /work. */
     remotePathBase?: string;
+    /** v1.2 additive: explicit runner image (env resolution step 1). */
+    image?: string;
+  };
+  /**
+   * v1.2 additive: devcontainer env spec (env resolution step 2). The server
+   * builds `stepaway-env:env-<hash>` in the cluster registry (cache-first)
+   * and boots the session pod from it. Ignored with a warning when the
+   * server has no registry configured.
+   */
+  envSpec?: {
+    /** sha256 (first 16 hex) over sorted .devcontainer/** paths + contents. */
+    hash: string;
+    /** base64 tar.gz of the .devcontainer files, <= 1 MiB. */
+    filesTgz: string;
   };
 }
 
