@@ -99,9 +99,10 @@ ingress:
 # this chart (no CRDs, no operator — session pods are created imperatively by
 # the backend).
 runner:
-  # Boot-installs claude/bun/compose at start (~60-90s). The prebaked
-  # ghcr.io/augustinbegue/stepaway-runner template image replaces this once
-  # published (P6: ~1s cold start).
+  # Fallback image when a session has no explicit image and no devcontainer
+  # (docs/architecture/environment-build.md). It installs claude/bun/compose at
+  # boot (~60-90s). Projects that want fast starts add a devcontainer.json —
+  # the built env image is cached in the registry and boots in seconds.
   image: node:22-bookworm-slim
   resources:
     cpuRequest: 250m
