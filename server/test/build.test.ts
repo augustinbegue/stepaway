@@ -377,7 +377,10 @@ describe("the Job manifest is the contract with the chart and the builder image"
     expect(yaml).toContain("image: ghcr.io/augustinbegue/stepaway-builder:v1");
     expect(yaml).toContain(`value: "registry.stepaway.dev/stepaway-env:env-${HASH}"`);
     expect(yaml).toContain(`value: ${ENVSPEC_PATH}`);
-    expect(yaml).toContain("value: ghcr.io/augustinbegue/stepaway-feature");
+    // the feature ref is the builder image's own default (full OCI ref); the
+    // Job must NOT override it, or the two drift (a truncated ref here once
+    // pointed at a nonexistent artifact)
+    expect(yaml).not.toContain("STEPAWAY_FEATURE");
     expect(yaml).toContain("name: stepaway-registry-auth");
     expect(yaml).toContain("key: username");
     expect(yaml).toContain("key: password");
