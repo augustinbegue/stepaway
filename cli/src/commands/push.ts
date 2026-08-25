@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { bashAsync, lastLine, shq } from "../sh.js";
+import { bashAsync, human, lastLine, shq } from "../sh.js";
 import { Ui, colorize, pad, type Spin } from "../ui.js";
 import {
   DEFAULT_INSTRUCTION,
@@ -30,7 +30,7 @@ import {
 import type { Client } from "../client.js";
 import { buildManifest, captureLocal, readLines, rewriteSessions, selectSession } from "../capture.js";
 import { carryEnvFiles, resolveEnvPlan, type EnvCarryResult } from "../envcarry.js";
-import { captureDocker, human, planDocker, type DockerPlan } from "../docker.js";
+import { captureDocker, planDocker, type DockerPlan } from "../docker.js";
 import { resolveSetup } from "../setup.js";
 import { describeRunnerEnv, resolveRunnerEnv, type RunnerEnv } from "../envspec.js";
 
@@ -55,7 +55,12 @@ export function consentSummary(
     target: string;
     docker: DockerPlan | null;
     setup: string | null;
-    /** the resolved `environment:` line (SPEC-v0.3 env resolution order). */
+    /**
+     * The resolved `environment:` line (SPEC-v0.3 env resolution order).
+     * Post-waitReady reality, not the plan: if the backend could not honour the
+     * devcontainer and downgraded it to the generic image, this line already
+     * says so by the time consent renders.
+     */
     environment: string;
     instruction: string;
     color?: boolean;
@@ -81,7 +86,7 @@ export function consentSummary(
   const big = c.largest_dirty_files.filter((f) => f.bytes > BIG_FILE_BYTES);
   if (big.length && !opts.verbose) {
     cont(`${big[0].path} (${human(big[0].bytes)})`, k.warn);
-    if (big.length > 1) cont(`+${big.length - 1} more over 50 MB — see --verbose`, k.dim);
+    if (big.length > 1) cont(`+${big.length - 1} more over 50 MiB — see --verbose`, k.dim);
   } else if (opts.verbose) {
     for (const f of c.largest_dirty_files) cont(`${f.path} (${human(f.bytes)})`, k.dim);
   }
@@ -555,7 +560,7 @@ export async function cmdPush(args: string[], flags: Record<string, any>): Promi
   // laptop: an oversized .devcontainer must fail with nothing created anywhere.
   let renv: RunnerEnv;
   try {
-    renv = resolveRunnerEnv(root, cfg.image);
+    renv = resolveRunnerEnv(root, cfg.image, { pack: true });
   } catch (e) {
     ui.error((e as Error).message);
     return 1;

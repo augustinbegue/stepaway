@@ -63,11 +63,14 @@ else
 fi
 
 # --- claude code ------------------------------------------------------------
+# pinned; bump deliberately. An unpinned `latest` makes every rebuild of the
+# same devcontainer hash produce a different toolchain.
+CLAUDE_CODE_VERSION="2.1.246"
 if command -v claude >/dev/null 2>&1; then
   log "claude already present: $(claude --version 2>/dev/null || echo unknown)"
 else
-  log "installing @anthropic-ai/claude-code"
-  npm install -g --no-audit --no-fund @anthropic-ai/claude-code
+  log "installing @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
+  npm install -g --no-audit --no-fund "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
 fi
 
 # --- bun --------------------------------------------------------------------

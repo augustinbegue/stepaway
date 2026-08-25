@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { run, shq } from "./sh.js";
+import { human, run, shq } from "./sh.js";
 
 /**
  * Env resolution step 2 (SPEC-v0.3): the project's devcontainer definition,
@@ -24,7 +24,9 @@ const BARE_FILE = ".devcontainer.json";
 export type EnvSpec = {
   /** sha256 (first 16 hex) over the sorted relative paths + contents. */
   hash: string;
-  /** base64 tar.gz of the same files, relative paths preserved. */
+  /** base64 tar.gz of the same files, relative paths preserved. Empty (with
+   * `bytes: 0`) when the spec was resolved without `pack` — see
+   * resolveRunnerEnv. */
   filesTgz: string;
   /** repo-relative paths that went in, sorted — for the consent summary. */
   files: string[];
@@ -83,12 +85,6 @@ export function envHash(root: string, files: string[]): string {
   return h.digest("hex").slice(0, 16);
 }
 
-function human(bytes: number): string {
-  if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(2)} MiB`;
-  if (bytes >= 1024) return `${Math.round(bytes / 1024)} KiB`;
-  return `${bytes} B`;
-}
-
 /**
  * Pack the env spec, or null when the project has no devcontainer.
  *
@@ -132,29 +128,33 @@ export type RunnerEnv =
 /**
  * First match wins: explicit `.stepaway.json` "image", else a devcontainer in
  * the repo, else the backend's generic runner image.
+ *
+ * `pack` is the only axis of variation: `push` needs the tarball (and wants an
+ * oversized `.devcontainer/` to be a hard error before anything is created
+ * anywhere), while `init` only reports what *would* happen, where packing is
+ * both wasted work and the wrong place to fail. Either way the hash is real,
+ * so both paths name the same environment.
  */
-export function resolveRunnerEnv(root: string, image: string | null | undefined): RunnerEnv {
+export function resolveRunnerEnv(
+  root: string,
+  image: string | null | undefined,
+  opts: { pack?: boolean } = {},
+): RunnerEnv {
   const explicit = typeof image === "string" ? image.trim() : "";
   if (explicit) return { kind: "image", image: explicit };
-  const spec = buildEnvSpec(root);
-  if (spec) return { kind: "devcontainer", spec };
-  return { kind: "generic" };
+  if (opts.pack) {
+    const spec = buildEnvSpec(root);
+    return spec ? { kind: "devcontainer", spec } : { kind: "generic" };
+  }
+  const files = devcontainerFiles(root);
+  if (!files.length) return { kind: "generic" };
+  return { kind: "devcontainer", spec: { hash: envHash(root, files), filesTgz: "", files, bytes: 0 } };
 }
 
 /**
- * The same answer as resolveRunnerEnv, as a one-liner, without packing
- * anything — for `init`, where nothing is about to be shipped and an oversized
- * `.devcontainer/` is not yet an error.
+ * The single owner of the `environment:` string — the consent summary line and
+ * `init`'s report are the same sentence by construction.
  */
-export function previewRunnerEnv(root: string, image: string | null | undefined): string {
-  const explicit = typeof image === "string" ? image.trim() : "";
-  if (explicit) return describeRunnerEnv({ kind: "image", image: explicit });
-  const files = devcontainerFiles(root);
-  if (!files.length) return describeRunnerEnv({ kind: "generic" });
-  return `devcontainer (hash ${envHash(root, files)}, built+cached on the runner)`;
-}
-
-/** The `environment:` line of the consent summary. */
 export function describeRunnerEnv(plan: RunnerEnv): string {
   if (plan.kind === "image") return `image ${plan.image} (explicit)`;
   if (plan.kind === "devcontainer") {

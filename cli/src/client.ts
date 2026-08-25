@@ -215,9 +215,13 @@ export class Client {
   ): Promise<Session> {
     const pendingMs = o.timeoutMs ?? 300_000;
     const buildMs = o.buildTimeoutMs ?? 1_320_000;
-    // first time we saw each non-terminal state: each gets its own clock, so a
+    // First time we saw each non-terminal state: each gets its own clock, so a
     // long build never eats the runner-boot budget that follows it.
-    const since: Record<string, number> = {};
+    // The 1_320_000ms build default is the server's 1200s (20min) Job
+    // activeDeadlineSeconds plus 2min of slack, so the Job's own failure —
+    // which carries a real reason — always wins the race against this timeout.
+    let buildingSince = 0;
+    let pendingSince = 0;
     for (;;) {
       const s = await this.getSession(id);
       o.onState?.(s);
@@ -225,8 +229,8 @@ export class Client {
         throw new ApiError(`session ${id} failed`, 0, s.detail ?? "no detail from the backend");
       }
       if (s.state === "building") {
-        since.building ??= Date.now();
-        if (Date.now() - since.building > buildMs) {
+        buildingSince ||= Date.now();
+        if (Date.now() - buildingSince > buildMs) {
           throw new ApiError(
             `env image for session ${id} still building after ${Math.round(buildMs / 1000)}s`,
             0,
@@ -234,8 +238,8 @@ export class Client {
           );
         }
       } else if (s.state === "pending") {
-        since.pending ??= Date.now();
-        if (Date.now() - since.pending > pendingMs) {
+        pendingSince ||= Date.now();
+        if (Date.now() - pendingSince > pendingMs) {
           throw new ApiError(
             `runner ${s.podName || id} still pending after ${Math.round(pendingMs / 1000)}s`,
             0,

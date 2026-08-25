@@ -245,6 +245,18 @@ function which(bin) {
 function shq(s) {
   return `'${s.replace(/'/g, `'\\''`)}'`;
 }
+function human(bytes) {
+  if (bytes < 1024)
+    return `${bytes} B`;
+  const units = ["KiB", "MiB", "GiB", "TiB"];
+  let b = bytes / 1024;
+  let i = 0;
+  while (b >= 1024 && i < units.length - 1) {
+    b /= 1024;
+    i++;
+  }
+  return i === 0 ? `${Math.round(b)} KiB` : `${b.toFixed(2)} ${units[i]}`;
+}
 
 // ../node_modules/.bun/@clack+core@1.4.3/node_modules/@clack/core/dist/index.mjs
 import { styleText } from "node:util";
@@ -2731,7 +2743,7 @@ import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
 // src/version.ts
-var VERSION = "0.4.0";
+var VERSION = "0.4.1";
 
 // src/client.ts
 class ApiError extends Error {
@@ -2889,7 +2901,8 @@ class Client {
   async waitReady(id, o2 = {}) {
     const pendingMs = o2.timeoutMs ?? 300000;
     const buildMs = o2.buildTimeoutMs ?? 1320000;
-    const since = {};
+    let buildingSince = 0;
+    let pendingSince = 0;
     for (;; ) {
       const s = await this.getSession(id);
       o2.onState?.(s);
@@ -2897,13 +2910,13 @@ class Client {
         throw new ApiError(`session ${id} failed`, 0, s.detail ?? "no detail from the backend");
       }
       if (s.state === "building") {
-        since.building ??= Date.now();
-        if (Date.now() - since.building > buildMs) {
+        buildingSince ||= Date.now();
+        if (Date.now() - buildingSince > buildMs) {
           throw new ApiError(`env image for session ${id} still building after ${Math.round(buildMs / 1000)}s`, 0, "the build Job is stuck or the registry is unreachable: stepaway doctor");
         }
       } else if (s.state === "pending") {
-        since.pending ??= Date.now();
-        if (Date.now() - since.pending > pendingMs) {
+        pendingSince ||= Date.now();
+        if (Date.now() - pendingSince > pendingMs) {
           throw new ApiError(`runner ${s.podName || id} still pending after ${Math.round(pendingMs / 1000)}s`, 0, "check the backend: stepaway doctor");
         }
       } else
@@ -3474,18 +3487,6 @@ async function captureDocker(root, captureDir, plan, log2) {
 `);
   return { manifest: manifest2, warnings };
 }
-function human(bytes) {
-  if (bytes < 1024)
-    return `${bytes} B`;
-  const u4 = ["KB", "MB", "GB", "TB"];
-  let b2 = bytes / 1024;
-  let i2 = 0;
-  while (b2 >= 1024 && i2 < u4.length - 1) {
-    b2 /= 1024;
-    i2++;
-  }
-  return `${b2.toFixed(b2 < 10 ? 1 : 0)} ${u4[i2]}`;
-}
 
 // src/setup.ts
 import * as fs7 from "node:fs";
@@ -3552,13 +3553,6 @@ function envHash(root, files) {
   }
   return h2.digest("hex").slice(0, 16);
 }
-function human2(bytes) {
-  if (bytes >= 1024 * 1024)
-    return `${(bytes / 1024 / 1024).toFixed(2)} MiB`;
-  if (bytes >= 1024)
-    return `${Math.round(bytes / 1024)} KiB`;
-  return `${bytes} B`;
-}
 function buildEnvSpec(root) {
   const files = devcontainerFiles(root);
   if (!files.length)
@@ -3573,30 +3567,25 @@ function buildEnvSpec(root) {
     const raw = fs8.readFileSync(tmp);
     const filesTgz = raw.toString("base64");
     if (filesTgz.length > ENVSPEC_MAX_BYTES) {
-      throw new Error(`devcontainer spec is too large to ship: ${human2(filesTgz.length)} of base64 tar.gz ` + `(limit ${human2(ENVSPEC_MAX_BYTES)}, ${files.length} file(s), ${human2(raw.length)} compressed). ` + `Keep build artifacts out of ${DEVCONTAINER_DIR}/, or set "image" in .stepaway.json to use a prebuilt image.`);
+      throw new Error(`devcontainer spec is too large to ship: ${human(filesTgz.length)} of base64 tar.gz ` + `(limit ${human(ENVSPEC_MAX_BYTES)}, ${files.length} file(s), ${human(raw.length)} compressed). ` + `Keep build artifacts out of ${DEVCONTAINER_DIR}/, or set "image" in .stepaway.json to use a prebuilt image.`);
     }
     return { hash: envHash(root, files), filesTgz, files, bytes: raw.length };
   } finally {
     fs8.rmSync(tmp, { force: true });
   }
 }
-function resolveRunnerEnv(root, image) {
+function resolveRunnerEnv(root, image, opts = {}) {
   const explicit = typeof image === "string" ? image.trim() : "";
   if (explicit)
     return { kind: "image", image: explicit };
-  const spec = buildEnvSpec(root);
-  if (spec)
-    return { kind: "devcontainer", spec };
-  return { kind: "generic" };
-}
-function previewRunnerEnv(root, image) {
-  const explicit = typeof image === "string" ? image.trim() : "";
-  if (explicit)
-    return describeRunnerEnv({ kind: "image", image: explicit });
+  if (opts.pack) {
+    const spec = buildEnvSpec(root);
+    return spec ? { kind: "devcontainer", spec } : { kind: "generic" };
+  }
   const files = devcontainerFiles(root);
   if (!files.length)
-    return describeRunnerEnv({ kind: "generic" });
-  return `devcontainer (hash ${envHash(root, files)}, built+cached on the runner)`;
+    return { kind: "generic" };
+  return { kind: "devcontainer", spec: { hash: envHash(root, files), filesTgz: "", files, bytes: 0 } };
 }
 function describeRunnerEnv(plan) {
   if (plan.kind === "image")
@@ -3626,7 +3615,7 @@ function consentSummary(m3, opts) {
   if (big.length && !opts.verbose) {
     cont(`${big[0].path} (${human(big[0].bytes)})`, k.warn);
     if (big.length > 1)
-      cont(`+${big.length - 1} more over 50 MB — see --verbose`, k.dim);
+      cont(`+${big.length - 1} more over 50 MiB — see --verbose`, k.dim);
   } else if (opts.verbose) {
     for (const f2 of c3.largest_dirty_files)
       cont(`${f2.path} (${human(f2.bytes)})`, k.dim);
@@ -3937,7 +3926,7 @@ async function cmdPush(args, flags) {
   const apiId = sid ?? randomUUID();
   let renv;
   try {
-    renv = resolveRunnerEnv(root, cfg.image);
+    renv = resolveRunnerEnv(root, cfg.image, { pack: true });
   } catch (e) {
     ui.error(e.message);
     return 1;
@@ -4348,7 +4337,7 @@ async function cmdInit(args, flags) {
     patch.image = cfg.image;
   patchConfig(root, patch);
   const setup = cfg.setup ?? detectSetup(root);
-  const env2 = previewRunnerEnv(root, cfg.image);
+  const env2 = describeRunnerEnv(resolveRunnerEnv(root, cfg.image));
   const global = readClientConfig();
   if (flags.json) {
     ui.raw(JSON.stringify({ path: p2, updated: existed, config: loadConfig(root) }, null, 2) + `

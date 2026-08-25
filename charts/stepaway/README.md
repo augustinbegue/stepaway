@@ -102,12 +102,22 @@ Notes:
   preserved across upgrades like the bearer token, and derives the
   dockerconfigjson Secret `registry.pullSecretName` that session pods use as an
   `imagePullSecret`. Backend env wired from it: `REGISTRY_HOST`,
-  `REGISTRY_USER`, `REGISTRY_PASS`, `REGISTRY_PULL_SECRET`, `BUILDER_IMAGE`.
+  `REGISTRY_USER`, `REGISTRY_PASS`, `REGISTRY_PULL_SECRET`, `REGISTRY_AUTH_SECRET`,
+  `BUILDER_IMAGE`.
   With `registry.enabled=false` none of these are set, which is how the backend
   knows the devcontainer path is off.
 - The Ingress for `registry.host` is rendered by *this* chart (the subchart's
   own `ingress.enabled` stays `false`) so the host lives in exactly one value.
-  Set `registry.expose.*` for class/annotations/TLS.
+  Set `registry.expose.*` for class/annotations/TLS. The Ingress backend (and
+  the GC command in NOTES) resolve the registry Service through a helper that
+  mirrors the subchart's own naming, `registry.fullnameOverride` /
+  `registry.nameOverride` included — verify with:
+
+  ```sh
+  helm template x charts/stepaway \
+    --set registry.enabled=true --set registry.host=r.ex \
+    --set registry.fullnameOverride=myreg | grep -n myreg
+  ```
 - Everything else under `registry.*` is the subchart's values surface
   (`persistence`, `resources`, `nodeSelector`, ...); see
   [twuni/docker-registry.helm](https://github.com/twuni/docker-registry.helm).
@@ -167,7 +177,7 @@ Notes:
 | `registry.expose.annotations` | `{}` | Extra annotations (a `proxy-body-size: 0` nginx annotation is always set). |
 | `registry.expose.tls.secretName` | `""` | TLS Secret for `registry.host`; empty = no TLS (pushes/pulls will fail). |
 | `registry.auth.secretName` | `stepaway-registry-auth` | Secret holding `username`/`password`/`htpasswd`. |
-| `registry.auth.regeneratePassword` | `false` | Force a new registry password on next upgrade. |
+| `registry.auth.regeneratePassword` | `false` | Force a new registry password on next upgrade. Requires a restart of the registry pod to take effect (it reads `/auth/htpasswd` at startup). |
 | `registry.pullSecretName` | `stepaway-registry-pull` | dockerconfigjson Secret used as `imagePullSecret` on session pods (`REGISTRY_PULL_SECRET`). |
 | `registry.persistence.enabled` | `true` | PVC-back the registry (subchart value). |
 | `registry.persistence.size` | `20Gi` | Registry PVC size. |

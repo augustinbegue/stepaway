@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { lastLine, run, runAsync, shq, which } from "./sh.js";
+import { human, lastLine, run, runAsync, shq, which } from "./sh.js";
 import type { DockerManifest } from "@stepaway/core";
 
 /**
@@ -197,16 +197,4 @@ export async function captureDocker(
   };
   fs.writeFileSync(path.join(captureDir, "meta", "docker.json"), JSON.stringify(manifest, null, 2) + "\n");
   return { manifest, warnings };
-}
-
-export function human(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  const u = ["KB", "MB", "GB", "TB"];
-  let b = bytes / 1024;
-  let i = 0;
-  while (b >= 1024 && i < u.length - 1) {
-    b /= 1024;
-    i++;
-  }
-  return `${b.toFixed(b < 10 ? 1 : 0)} ${u[i]}`;
 }

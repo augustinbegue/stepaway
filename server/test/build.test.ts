@@ -24,6 +24,7 @@ import {
   validateEnvSpec,
 } from "../src/build.js";
 import { ANN } from "../src/sessions.js";
+import { pollBuild } from "../src/server.js";
 import { MockK8s } from "./mock-k8s.js";
 
 const TOKEN = "test-token-0123456789";
@@ -287,6 +288,30 @@ describe("advanceBuild", () => {
     expect(await advanceBuild(d, watch)).toBe("failed"); // re-reads the annotation, does nothing
   });
 
+  test("a registry that cannot answer leaves the session building, it does not fail it", async () => {
+    const { k8s, watch } = await building();
+    k8s.jobs.clear(); // reaped by its TTL: the registry is the only witness left
+    let asked = 0;
+    const d: AppDeps = {
+      ...deps({
+        k8s,
+        check: async () => {
+          asked++;
+          throw new Error("registry registry.stepaway.dev unreachable: ECONNREFUSED");
+        },
+      }),
+      onSessionCreated: () => undefined,
+    };
+    // "I don't know" is not "it failed": a succeeded build must not be buried
+    // by an outage. The state stays building and the next poll retries.
+    expect(await advanceBuild(d, watch)).toBe("building");
+    expect(k8s.pvcObjects.get(POD)!.metadata.annotations?.[ANN.state]).toBe("building");
+    expect(k8s.pods.size).toBe(0);
+    expect(k8s.secrets.has(envSpecSecretName(HASH))).toBe(true); // nothing cleaned up yet
+    expect(await advanceBuild(d, watch)).toBe("building");
+    expect(asked).toBe(2);
+  });
+
   test("a deleted session ends the watch", async () => {
     const { k8s, d, watch } = await building();
     k8s.pvcObjects.clear();
@@ -303,6 +328,70 @@ describe("advanceBuild", () => {
     expect(((await res.json()) as Session).state).toBe("building");
     expect(k8s.deleted).toContain(`job/${buildJobName(HASH)}`);
     expect(k8s.jobs.get(buildJobName(HASH))!.status?.active).toBe(1);
+  });
+});
+
+describe("a building session is a 409 on the pod routes, never a 404", () => {
+  async function building() {
+    const k8s = new MockK8s();
+    const d = deps({ k8s, cached: false });
+    await post(d, createBody());
+    return { k8s, app: createApp(d) };
+  }
+
+  test("GET /sessions/:id answers, so capture must not claim there is no session", async () => {
+    const { app } = await building();
+    expect((await app.fetch(req(ROUTES.session(SID)))).status).toBe(200);
+
+    const res = await app.fetch(req(ROUTES.capture(SID), { method: "POST", body: "irrelevant" }));
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ error: "session is still building", detail: "building" });
+  });
+
+  test("run on a building session is a 409 and starts nothing", async () => {
+    const { k8s, app } = await building();
+    const res = await app.fetch(req(ROUTES.run(SID), { method: "POST", body: "{}" }));
+    expect(res.status).toBe(409);
+    expect((await res.json()).detail).toBe("building");
+    expect(k8s.execs).toHaveLength(0);
+  });
+
+  test("a session that does not exist at all is still a 404", async () => {
+    const { app } = await building();
+    const res = await app.fetch(req(ROUTES.run(SID2), { method: "POST", body: "{}" }));
+    expect(res.status).toBe(404);
+    expect((await res.json()).error).toBe("no such session");
+  });
+});
+
+describe("pollBuild", () => {
+  test("timing out fails the session and cleans up like every other terminal path", async () => {
+    const k8s = new MockK8s();
+    const d = deps({ k8s, cached: false });
+    await post(d, createBody());
+    expect(k8s.secrets.has(envSpecSecretName(HASH))).toBe(true);
+
+    // The Job stays "running" forever; only the deadline can end this watch.
+    await pollBuild(d, { name: POD, sessionId: SID, hash: HASH }, { pollMs: 1, timeoutMs: -1 });
+
+    const pvc = k8s.pvcObjects.get(POD)!;
+    expect(pvc.metadata.annotations?.[ANN.state]).toBe("failed");
+    expect(pvc.metadata.annotations?.[ANN.detail]).toContain("did not finish");
+    // the privileged dind Job must not be left burning until activeDeadlineSeconds
+    expect(k8s.jobs.has(buildJobName(HASH))).toBe(false);
+    expect(k8s.deleted).toContain(`job/${buildJobName(HASH)}`);
+    expect(k8s.secrets.has(envSpecSecretName(HASH))).toBe(false);
+  });
+
+  test("a build that resolves ends the watch without touching the session", async () => {
+    const k8s = new MockK8s();
+    const d = deps({ k8s, cached: false });
+    await post(d, createBody());
+    k8s.jobs.get(buildJobName(HASH))!.status = { succeeded: 1 };
+
+    await pollBuild(d, { name: POD, sessionId: SID, hash: HASH }, { pollMs: 1, timeoutMs: 10_000 });
+    expect(k8s.pods.has(POD)).toBe(true);
+    expect(k8s.deleted).not.toContain(`job/${buildJobName(HASH)}`);
   });
 });
 

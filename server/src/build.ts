@@ -12,24 +12,30 @@
  * build path is testable without a registry or a cluster.
  */
 
+import { AUTH_SECRET, podManifest, type SessionState } from "@stepaway/core";
 import type { K8s } from "./k8s.js";
-import type { RegistryConfig } from "./config.js";
+import type { RegistryConfig, ServerConfig } from "./config.js";
+import { ANN, annotationState, findSessionRecord, setRecordState } from "./sessions.js";
 
 /** Repository inside the registry that holds every built env image. */
 export const ENV_REPO = "stepaway-env";
 
-/** Label that ties a build Job (and its pod) to the env hash it is building. */
-export const ENV_HASH_LABEL = "stepaway.dev/env-hash";
+/**
+ * Label that ties a build Job (and its pod) to the env hash it is building.
+ * Same key as the session annotation, and deliberately the same const: the
+ * two must match for `stepaway.dev/env-hash` to mean one thing in the cluster.
+ */
+export const ENV_HASH_LABEL = ANN.envHash;
 
 /** Key of the tar.gz inside the envspec Secret, and where the builder finds it. */
 export const ENVSPEC_KEY = "files.tgz";
 export const ENVSPEC_MOUNT = "/spec";
 export const ENVSPEC_PATH = `${ENVSPEC_MOUNT}/${ENVSPEC_KEY}`;
 
-/** The devcontainer feature the builder always merges in (SPEC-v0.3). */
-// The feature ref is the builder image's own default (STEPAWAY_FEATURE env in
-// builder/Dockerfile — full OCI ref incl. /stepaway:0); the Job deliberately
-// does not override it so the two can't drift.
+// The devcontainer feature the builder always merges in (SPEC-v0.3) is the
+// builder image's own default (STEPAWAY_FEATURE in builder/Dockerfile — a full
+// OCI ref incl. /stepaway:0); the Job deliberately does not override it, so the
+// two cannot drift.
 
 /** ≤ 1 MiB of .devcontainer files — the contract in api.ts. */
 export const MAX_ENVSPEC_BYTES = 1024 * 1024;
@@ -93,13 +99,15 @@ export function registryManifestCheck(cfg: RegistryConfig, fetchImpl: typeof fet
 export type EnvSpecInput = { hash: string; filesTgz: string };
 export type EnvSpecCheck = { ok: true; bytes: number } | { ok: false; detail: string };
 
-const BASE64 = /^[A-Za-z0-9+/]*={0,2}$/;
-
 /**
  * The payload is user input that becomes a Secret and then a tar the builder
  * unpacks. The server cannot see inside the tar (the builder untars it), so it
  * enforces what it *can*: a well-formed hash, real base64, and the 1 MiB cap —
  * before anything reaches the cluster.
+ *
+ * "Real base64" is checked exactly once, by decode round-trip: Buffer.from is
+ * lenient (it drops what it does not understand), so re-encoding and comparing
+ * is the only honest test — and it subsumes any shape regex.
  */
 export function validateEnvSpec(spec: EnvSpecInput): EnvSpecCheck {
   if (!isEnvHash(spec.hash ?? "")) {
@@ -107,19 +115,12 @@ export function validateEnvSpec(spec: EnvSpecInput): EnvSpecCheck {
   }
   const raw = (spec.filesTgz ?? "").replace(/\s+/g, "");
   if (!raw) return { ok: false, detail: "envSpec.filesTgz is empty" };
-  if (!BASE64.test(raw)) return { ok: false, detail: "envSpec.filesTgz is not valid base64" };
-  // Cheap length math first: never allocate a megabyte to find out it is two.
-  const bytes = Math.floor((raw.length * 3) / 4) - (raw.endsWith("==") ? 2 : raw.endsWith("=") ? 1 : 0);
-  if (bytes > MAX_ENVSPEC_BYTES) {
-    return { ok: false, detail: `envSpec.filesTgz is ${bytes} bytes; the limit is ${MAX_ENVSPEC_BYTES}` };
-  }
   let decoded: Buffer;
   try {
     decoded = Buffer.from(raw, "base64");
   } catch {
     return { ok: false, detail: "envSpec.filesTgz is not valid base64" };
   }
-  // Buffer.from is lenient: a round-trip is the only honest base64 check.
   if (decoded.length === 0 || decoded.toString("base64").replace(/=+$/, "") !== raw.replace(/=+$/, "")) {
     return { ok: false, detail: "envSpec.filesTgz is not valid base64" };
   }
@@ -299,4 +300,113 @@ export async function buildLogTail(k8s: K8s, hash: string, lines = 20): Promise<
 /** Best-effort removal of the envspec Secret once the build is over. */
 export async function cleanupEnvSpec(k8s: K8s, hash: string): Promise<void> {
   await k8s.deleteSecret(envSpecSecretName(hash)).catch(() => undefined);
+}
+
+// -----------------------------------------------------------------------
+// the `building` watch
+// -----------------------------------------------------------------------
+
+/** What the build watcher needs to finish a `building` session. */
+export type BuildWatch = { name: string; sessionId: string; hash: string };
+
+export type AppDeps = {
+  k8s: K8s;
+  config: ServerConfig;
+  /** injectable for tests; the real one polls claude --version. */
+  onSessionCreated?: (podName: string) => void;
+  /**
+   * Called when a session enters `building`. The real one polls the Job (same
+   * shape as the pending->ready poll); tests drive advanceBuild() by hand.
+   */
+  onBuildStarted?: (watch: BuildWatch) => void;
+  /** injectable registry cache probe; defaults to the configured registry. */
+  manifestCheck?: ManifestCheck;
+};
+
+/** The configured registry probe, or null when the devcontainer path is off. */
+export function resolveManifestCheck(deps: AppDeps): ManifestCheck | null {
+  if (deps.manifestCheck) return deps.manifestCheck;
+  return deps.config.registry.host ? registryManifestCheck(deps.config.registry) : null;
+}
+
+/**
+ * One step of the `building` watch: look at the Job, and either leave the
+ * session building, boot its pod from the freshly pushed image, or fail it
+ * with the builder's log tail.
+ *
+ * Deliberately a single idempotent step rather than a loop, so the polling
+ * lives in server.ts (next to the pending->ready poll it mirrors) and the
+ * tests can drive the transitions without timers.
+ */
+export async function advanceBuild(deps: AppDeps, w: BuildWatch): Promise<SessionState | "gone"> {
+  const { k8s, config } = deps;
+  const rec = await findSessionRecord(k8s, w.name);
+  if (!rec) return "gone";
+  // The pod exists: someone already finished this build (or the user recreated
+  // the session). Nothing left to watch.
+  if (rec.kind === "pod") return "pending";
+  const state = annotationState(rec.object);
+  if (state !== "building") return state;
+
+  const job = await k8s.getJob(buildJobName(w.hash)).catch(() => null);
+  let outcome = jobOutcome(job);
+  if (outcome === "running") return "building";
+  if (outcome === "gone") {
+    // ttlSecondsAfterFinished can reap a *successful* Job before we look. The
+    // registry is the truth: if the image is there, the build worked.
+    const check = resolveManifestCheck(deps);
+    if (!check) {
+      outcome = "failed"; // no registry to ask, and the Job's verdict is gone
+    } else {
+      let pushed: boolean;
+      try {
+        pushed = await check(w.hash);
+      } catch (e) {
+        // A registry outage is not a verdict. Failing here would permanently
+        // mark a *succeeded* build as failed, which is exactly the invariant
+        // registryManifestCheck() exists to protect: 200 = hit, 404 = miss,
+        // anything else is "I don't know". Stay building; the next poll retries.
+        console.warn(`stepaway: build ${w.hash} verdict unknown: ${(e as Error).message}`);
+        return "building";
+      }
+      outcome = pushed ? "succeeded" : "failed";
+    }
+  }
+
+  if (outcome === "succeeded") {
+    await cleanupEnvSpec(k8s, w.hash);
+    const ann = { ...(rec.object.metadata.annotations ?? {}) };
+    const image = ann[ANN.image] || envImageRef(config.registry.host, w.hash);
+    const pullSecret = ann[ANN.pullSecret] || config.registry.pullSecret;
+    const podAnn: Record<string, string> = { ...ann, [ANN.state]: "pending" };
+    delete podAnn[ANN.detail];
+    try {
+      await k8s.createFromYaml(
+        "pods",
+        podManifest({
+          name: w.name,
+          sessionId: w.sessionId,
+          secretName: AUTH_SECRET,
+          ...config.runner,
+          image,
+          imagePullSecrets: pullSecret ? [pullSecret] : [],
+          annotations: podAnn,
+        }),
+      );
+    } catch (e) {
+      await setRecordState(k8s, rec, "failed", { [ANN.detail]: `could not start the runner: ${(e as Error).message}` });
+      return "failed";
+    }
+    // The PVC keeps a stale annotation for a moment; the pod is authoritative
+    // from here on (findSessionRecord prefers it), but keep them consistent.
+    await setRecordState(k8s, rec, "pending", { [ANN.detail]: null });
+    deps.onSessionCreated?.(w.name);
+    return "pending";
+  }
+
+  const detail =
+    (await buildLogTail(k8s, w.hash)) || jobFailureReason(job) || "the devcontainer build failed with no output";
+  await cleanupEnvSpec(k8s, w.hash);
+  await setRecordState(k8s, rec, "failed", { [ANN.detail]: detail.slice(-400) });
+  return "failed";
 }

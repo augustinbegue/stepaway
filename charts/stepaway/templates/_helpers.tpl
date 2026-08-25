@@ -75,14 +75,23 @@ Name of the bearer-token Secret.
 
 {{/*
 Name of the docker-registry subchart's objects (Service/Deployment/PVC).
-Mirrors the subchart's own `docker-registry.fullname`, with the dependency
-aliased to `registry` (so .Chart.Name inside it is "registry").
+Mirrors the subchart's own `docker-registry.fullname` exactly, including the
+`fullnameOverride` / `nameOverride` escape hatches — the dependency is aliased
+to `registry`, so .Chart.Name inside it is "registry" and that is the default
+`$name` here. Anything that references the registry Service by name (the
+Ingress backend, the GC command in NOTES.txt) goes through this helper, so all
+three stay in step when a user overrides the name.
 */}}
 {{- define "stepaway.registryFullname" -}}
-{{- if contains "registry" .Release.Name }}
+{{- if .Values.registry.fullnameOverride }}
+{{- .Values.registry.fullnameOverride | trunc 63 | trimSuffix "-" }}
+{{- else }}
+{{- $name := default "registry" .Values.registry.nameOverride }}
+{{- if contains $name .Release.Name }}
 {{- .Release.Name | trunc 63 | trimSuffix "-" }}
 {{- else }}
-{{- printf "%s-registry" .Release.Name | trunc 63 | trimSuffix "-" }}
+{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" }}
+{{- end }}
 {{- end }}
 {{- end }}
 

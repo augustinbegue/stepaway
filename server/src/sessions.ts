@@ -57,10 +57,17 @@ export { DEFAULT_REMOTE_BASE };
  * label), so it is the natural home for the pre-pod annotations. Everything
  * downstream reads a `SessionRecord` and stops caring which of the two it is.
  */
-export type SessionRecord = { kind: "pod" | "pvc"; object: PodObject };
+export type SessionRecord = { kind: "pod"; object: PodObject } | { kind: "pvc"; object: PvcObject };
+
+/**
+ * The part of a session object every helper below actually reads: the
+ * metadata. A PVC has exactly that and nothing else, which is why the two
+ * kinds can share one set of accessors without a cast.
+ */
+export type Annotated = { metadata: PodObject["metadata"] };
 
 export const podRecord = (object: PodObject): SessionRecord => ({ kind: "pod", object });
-export const pvcRecord = (object: PvcObject): SessionRecord => ({ kind: "pvc", object: object as PodObject });
+export const pvcRecord = (object: PvcObject): SessionRecord => ({ kind: "pvc", object });
 
 /** The pod if it exists, else the PVC standing in for a pre-pod session. */
 export async function findSessionRecord(k8s: K8s, name: string): Promise<SessionRecord | null> {
@@ -91,13 +98,21 @@ export async function listSessionRecords(k8s: K8s): Promise<SessionRecord[]> {
   return out;
 }
 
-/** Annotation write against whichever object currently holds the state. */
+/**
+ * THE annotation write: against whichever object currently holds the state.
+ *
+ * Two properties every caller relies on:
+ *   - best effort — a failed write never fails a request, because the next
+ *     read re-derives the same answer from the cluster;
+ *   - the in-memory record is updated too, always, write or no write, so a
+ *     caller that keeps holding `rec` sees what it just set.
+ */
 export async function patchRecord(k8s: K8s, rec: SessionRecord, ann: Record<string, string | null>): Promise<void> {
   try {
     if (rec.kind === "pod") await k8s.patchPodAnnotations(rec.object.metadata.name, ann);
     else await k8s.patchPvcAnnotations(rec.object.metadata.name, ann);
   } catch {
-    // best-effort, exactly like patch() below
+    // best effort: see the doc comment above
   }
   const merged = { ...(rec.object.metadata.annotations ?? {}) };
   for (const [k, v] of Object.entries(ann)) {
@@ -117,32 +132,33 @@ export async function setRecordState(
 }
 
 /** The session's remote base (`remotePathBase` at create time), default /work. */
-export function remoteBaseOf(pod: PodObject): string {
-  const raw = pod.metadata.annotations?.[ANN.remoteBase] || DEFAULT_REMOTE_BASE;
+export function remoteBaseOf(o: Annotated): string {
+  const raw = o.metadata.annotations?.[ANN.remoteBase] || DEFAULT_REMOTE_BASE;
   return raw.replace(/\/+$/, "") || "/";
 }
 
 const STATES: SessionState[] = ["building", "pending", "restoring", "ready", "running", "done", "failed"];
 
-function annotationState(pod: PodObject): SessionState {
-  const raw = pod.metadata.annotations?.[ANN.state];
+/** The last state the backend *wrote*, validated — never a raw annotation. */
+export function annotationState(o: Annotated): SessionState {
+  const raw = o.metadata.annotations?.[ANN.state];
   return (STATES as string[]).includes(raw ?? "") ? (raw as SessionState) : "pending";
 }
 
-export function sessionIdOf(pod: PodObject): string {
-  return pod.metadata.labels?.[SESSION_LABEL] ?? pod.metadata.name;
+export function sessionIdOf(o: Annotated): string {
+  return o.metadata.labels?.[SESSION_LABEL] ?? o.metadata.name;
 }
 
 /** Work tree for a session: the restore's target, or where it will be. */
-export function workTreeOf(pod: PodObject): string {
-  const a = pod.metadata.annotations ?? {};
+export function workTreeOf(o: Annotated): string {
+  const a = o.metadata.annotations ?? {};
   if (a[ANN.workTree]) return a[ANN.workTree];
-  const base = remoteBaseOf(pod);
+  const base = remoteBaseOf(o);
   return `${base === "/" ? "" : base}/${a[ANN.project] ?? "project"}`;
 }
 
-export function gitDirOf(pod: PodObject): string {
-  return `/repo/${pod.metadata.annotations?.[ANN.project] ?? "project"}.git`;
+export function gitDirOf(o: Annotated): string {
+  return `/repo/${o.metadata.annotations?.[ANN.project] ?? "project"}.git`;
 }
 
 function podReady(pod: PodObject): boolean {
@@ -155,32 +171,32 @@ function podReady(pod: PodObject): boolean {
  * wants what the annotations already say.
  */
 export async function toSession(k8s: K8s, rec: SessionRecord, opts: { probe?: boolean } = {}): Promise<Session> {
-  const pod = rec.object;
-  const a = pod.metadata.annotations ?? {};
-  const name = pod.metadata.name;
-  let state = annotationState(pod);
+  const obj: Annotated = rec.object;
+  const a = obj.metadata.annotations ?? {};
+  const name = obj.metadata.name;
+  let state = annotationState(obj);
   let exitCode: number | null | undefined = a[ANN.exitCode] !== undefined ? Number(a[ANN.exitCode]) : undefined;
   let detail = a[ANN.detail];
 
   // A `building` session has no pod to exec into: its transitions are driven
   // by the build watcher, never derived here.
-  if (opts.probe !== false && rec.kind === "pod" && !pod.metadata.deletionTimestamp) {
-    if (state === "pending" && podReady(pod)) {
+  if (opts.probe !== false && rec.kind === "pod" && !rec.object.metadata.deletionTimestamp) {
+    if (state === "pending" && podReady(rec.object)) {
       // pending -> ready: claude installs at boot, so pod-Ready is not enough.
       const r = await safeExec(k8s, name, bashLine("claude --version"));
       if (r && r.code === 0) {
         state = "ready";
-        await patch(k8s, name, { [ANN.state]: "ready" });
+        await patchRecord(k8s, rec, { [ANN.state]: "ready" });
       }
     } else if (state === "running") {
       // running -> done|failed: the launch wrapper's exit marker.
-      const r = await safeExec(k8s, name, bashLine(`cat ${exitMarkerPath(remoteBaseOf(pod))} 2>/dev/null || true`));
+      const r = await safeExec(k8s, name, bashLine(`cat ${exitMarkerPath(remoteBaseOf(obj))} 2>/dev/null || true`));
       const raw = r?.stdout.trim();
       if (raw && /^\d+$/.test(raw)) {
         exitCode = Number(raw);
         state = exitCode === 0 ? "done" : "failed";
         if (exitCode !== 0) detail = detail ?? `the unattended run exited ${exitCode}`;
-        await patch(k8s, name, {
+        await patchRecord(k8s, rec, {
           [ANN.state]: state,
           [ANN.exitCode]: String(exitCode),
           ...(detail ? { [ANN.detail]: detail } : {}),
@@ -190,33 +206,28 @@ export async function toSession(k8s: K8s, rec: SessionRecord, opts: { probe?: bo
   }
 
   const session: Session = {
-    id: sessionIdOf(pod),
+    id: sessionIdOf(obj),
     project: a[ANN.project] ?? "",
     state,
     podName: name,
-    createdAt: a[ANN.createdAt] ?? pod.metadata.creationTimestamp ?? new Date(0).toISOString(),
+    createdAt: a[ANN.createdAt] ?? obj.metadata.creationTimestamp ?? new Date(0).toISOString(),
   };
   if (state === "done" || state === "failed") session.exitCode = exitCode ?? null;
   if (detail) session.detail = detail;
   return session;
 }
 
+/**
+ * The pod-only convenience over setRecordState(), for the routes that already
+ * hold a runner pod. Same semantics, including the local-annotation update.
+ */
 export async function setState(
   k8s: K8s,
-  podName: string,
+  pod: PodObject,
   state: SessionState,
   extra: Record<string, string | null> = {},
 ): Promise<void> {
-  await patch(k8s, podName, { [ANN.state]: state, ...extra });
-}
-
-async function patch(k8s: K8s, podName: string, ann: Record<string, string | null>): Promise<void> {
-  try {
-    await k8s.patchPodAnnotations(podName, ann);
-  } catch {
-    // A best-effort annotation write must never fail a request: the next read
-    // re-derives the same answer from the pod.
-  }
+  await setRecordState(k8s, podRecord(pod), state, extra);
 }
 
 /**

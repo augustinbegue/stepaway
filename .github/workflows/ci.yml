@@ -30,67 +30,77 @@ jobs:
       - run: bun test server/test
       - run: cd cli && bun run build && bun run test:e2e
 
-  image:
-    # Publishes ghcr.io/<owner>/stepaway-server:<version> (+ latest) using the
-    # workflow's own GITHUB_TOKEN — no PAT anywhere.
+  images:
+    # Publishes, using the workflow's own GITHUB_TOKEN — no PAT anywhere:
+    #   stepaway-server  :<version from server/package.json> + :latest
+    #                     on every push (branch main and v* tags)
+    #   stepaway-builder :<sha> + :latest, main only. This is the image of the
+    #                     k8s Job that builds a session's devcontainer
+    #                     environment; the chart passes it as BUILDER_IMAGE.
+    #
+    # The two differ only in context/dockerfile/tag, so they share one matrix
+    # job. `matrix` is not available in a job-level `if`, so the main-only rule
+    # for the builder lives on the publish steps instead: the builder's matrix
+    # leg still spins up on tag pushes, it just does not build or push.
     needs: test
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: server
+            image: stepaway-server
+            context: .
+            dockerfile: server/Dockerfile
+            main_only: false
+          - name: builder
+            image: stepaway-builder
+            context: builder
+            dockerfile: builder/Dockerfile
+            main_only: true
     steps:
       - uses: actions/checkout@v4
-      - id: ver
-        run: echo "version=$(jq -r .version server/package.json)" >> "$GITHUB_OUTPUT"
+      - id: gate
+        # `publish` is the per-image equivalent of the old job-level `if`.
+        run: |
+          if [ "${{ matrix.main_only }}" = "true" ] && [ "${{ github.ref }}" != "refs/heads/main" ]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+      - id: tag
+        if: steps.gate.outputs.publish == 'true'
+        # server is versioned from its package.json; builder is content-addressed
+        # by commit. Both also move :latest.
+        run: |
+          if [ "${{ matrix.name }}" = "server" ]; then
+            echo "value=$(jq -r .version server/package.json)" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          fi
       - uses: docker/login-action@v3
+        if: steps.gate.outputs.publish == 'true'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - uses: docker/setup-buildx-action@v3
+        if: steps.gate.outputs.publish == 'true'
       - uses: docker/build-push-action@v6
+        if: steps.gate.outputs.publish == 'true'
         with:
-          context: .
-          file: server/Dockerfile
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
           push: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
           tags: |
-            ghcr.io/${{ github.repository_owner }}/stepaway-server:${{ steps.ver.outputs.version }}
-            ghcr.io/${{ github.repository_owner }}/stepaway-server:latest
-          labels: |
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.licenses=AGPL-3.0
-
-  builder-image:
-    # Publishes ghcr.io/<owner>/stepaway-builder:latest (+ :<sha>). This is the
-    # image of the k8s Job that builds a session's devcontainer environment;
-    # the chart passes it to the backend as BUILDER_IMAGE.
-    needs: test
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
-        with:
-          context: builder
-          file: builder/Dockerfile
-          push: true
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          tags: |
-            ghcr.io/${{ github.repository_owner }}/stepaway-builder:${{ github.sha }}
-            ghcr.io/${{ github.repository_owner }}/stepaway-builder:latest
+            ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:${{ steps.tag.outputs.value }}
+            ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:latest
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.licenses=AGPL-3.0

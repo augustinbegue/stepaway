@@ -245,6 +245,33 @@ async function main() {
     (devPush.out + devPush.err).includes("building devcontainer env image"),
   );
 
+  // (a2) a *bare* .devcontainer.json at the repo root (no .devcontainer/ dir)
+  // is a devcontainer too: same hash rule, and the tar holds the bare path.
+  const bareProj = project("bare", { ".devcontainer.json": DEVCONTAINER });
+  const barePush = await cli(["push", "--yes", ...E], { cwd: bareProj });
+  check("push with a bare .devcontainer.json exits 0", barePush.code === 0, barePush.err.trim().split("\n").slice(-2).join(" | "));
+  const bareCreate = envMock.calls.filter((c) => c.method === "POST" && c.path === "/v1/sessions" && c.body?.envSpec).pop();
+  const bareHash = expectedEnvHash(bareProj, [".devcontainer.json"]);
+  check("bare .devcontainer.json hashes per the spec", bareCreate?.body?.envSpec?.hash === bareHash, `${bareCreate?.body?.envSpec?.hash} vs ${bareHash}`);
+  check(
+    "bare spec tar holds .devcontainer.json at the root",
+    (() => {
+      const tz = Buffer.from(bareCreate?.body?.envSpec?.filesTgz ?? "", "base64");
+      if (!gzip(tz) || !tz.length) return false;
+      const p2 = path.join(ROOT, "bare.tgz");
+      fs.writeFileSync(p2, tz);
+      const listed = sh(`tar tzf ${p2}`, ROOT)
+        .split("\n")
+        .map((l) => l.trim().replace(/^\.\//, ""))
+        .filter(Boolean);
+      return listed.length === 1 && listed[0] === ".devcontainer.json";
+    })(),
+  );
+  check(
+    "bare .devcontainer.json names the devcontainer environment",
+    (barePush.out + barePush.err).includes(`devcontainer (hash ${bareHash}, built+cached on the runner)`),
+  );
+
   // (b) explicit image in .stepaway.json wins over the devcontainer
   const imgProj = project("img", {
     ...devFiles,

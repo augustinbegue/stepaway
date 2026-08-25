@@ -13,8 +13,7 @@
 import { Hono } from "hono";
 import type { Context } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
-import { timingSafeEqual } from "node:crypto";
-import { createHash } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import {
   AUTH_SECRET,
   AUTH_SECRET_KEY,
@@ -50,6 +49,7 @@ import type { K8s, PodObject } from "./k8s.js";
 import {
   ANN,
   DEFAULT_REMOTE_BASE,
+  annotationState,
   findSessionRecord,
   gitDirOf,
   listSessionRecords,
@@ -63,35 +63,19 @@ import {
 import { bashLine, bashScript, lastLine, shq, tail } from "./sh.js";
 import { VERSION, type ServerConfig } from "./config.js";
 import {
-  buildJobName,
-  buildLogTail,
   cleanupEnvSpec,
   ensureBuildJob,
   envImageRef,
-  jobFailureReason,
-  jobOutcome,
   putEnvSpecSecret,
-  registryManifestCheck,
+  resolveManifestCheck,
   validateEnvSpec,
-  type ManifestCheck,
+  type AppDeps,
 } from "./build.js";
 
-/** What the build watcher needs to finish a `building` session. */
-export type BuildWatch = { name: string; sessionId: string; hash: string };
-
-export type AppDeps = {
-  k8s: K8s;
-  config: ServerConfig;
-  /** injectable for tests; the real one polls claude --version. */
-  onSessionCreated?: (podName: string) => void;
-  /**
-   * Called when a session enters `building`. The real one polls the Job (same
-   * shape as the pending->ready poll); tests drive advanceBuild() by hand.
-   */
-  onBuildStarted?: (watch: BuildWatch) => void;
-  /** injectable registry cache probe; defaults to the configured registry. */
-  manifestCheck?: ManifestCheck;
-};
+// advanceBuild and the deps it needs live in build.ts (they are not
+// Hono-specific); re-exported here because that is where callers found them.
+export { advanceBuild, resolveManifestCheck } from "./build.js";
+export type { AppDeps, BuildWatch } from "./build.js";
 
 /** HOME in the runner (podspec.ts pins it). */
 const RUNNER_HOME = "/root";
@@ -259,16 +243,16 @@ export function createApp(deps: AppDeps) {
 
   // ---- capture: upload -> restore -> docker -> setup ---------------------
   app.post("/v1/sessions/:id/capture", async (c) => {
-    const pod = await requirePod(c);
-    if (!pod) return notFound(c);
-    const runner = pod; // alias: the hoisted runCapture() below loses the narrowing
+    const found = await requirePod(c);
+    if ("res" in found) return found.res;
+    const pod = found.pod;
     const name = pod.metadata.name;
     const body = c.req.raw.body;
     if (!body) return fail(c, 400, "empty body", "the request body must be the capture tar.gz stream");
 
     const setupCmd = (c.req.query("setup") ?? "").trim();
     const dir = `/tmp/stepaway-cap-${Date.now()}`;
-    await setState(k8s, name, "restoring", { [ANN.detail]: null });
+    await setState(k8s, pod, "restoring", { [ANN.detail]: null });
 
     /** Best-effort removal of the staging dir; never fails the request. */
     const cleanup = () =>
@@ -276,7 +260,7 @@ export function createApp(deps: AppDeps) {
 
     const failRestore = async (status: ContentfulStatusCode, error: string, detail: string) => {
       await cleanup();
-      await setState(k8s, name, "failed", { [ANN.detail]: detail.slice(0, 400) });
+      await setState(k8s, pod, "failed", { [ANN.detail]: detail.slice(0, 400) });
       return fail(c, status, error, detail);
     };
 
@@ -314,10 +298,10 @@ export function createApp(deps: AppDeps) {
       }
       const branch = manifest.captured.branch || "main";
 
-      const workTree = workTreeOf(runner);
-      const gitDir = gitDirOf(runner);
+      const workTree = workTreeOf(pod);
+      const gitDir = gitDirOf(pod);
       const slug = slugFor(workTree);
-      await setState(k8s, name, "restoring", { [ANN.workTree]: workTree });
+      await setState(k8s, pod, "restoring", { [ANN.workTree]: workTree });
 
       // 3. restore (separate git dir on the PVC)
       const rest = await k8s.exec(name, bashScript(RESTORE_RUNNER_SH, [capDir, gitDir, workTree, branch, slug]), {
@@ -361,15 +345,16 @@ export function createApp(deps: AppDeps) {
 
       await cleanup();
       // A failed setup is not a failed session: the agent can usually fix it.
-      await setState(k8s, name, "ready", { [ANN.detail]: null });
+      await setState(k8s, pod, "ready", { [ANN.detail]: null });
       return c.json<CaptureReport>(report);
     }
   });
 
   // ---- run --------------------------------------------------------------
   app.post("/v1/sessions/:id/run", async (c) => {
-    const pod = await requirePod(c);
-    if (!pod) return notFound(c);
+    const found = await requirePod(c);
+    if ("res" in found) return found.res;
+    const pod = found.pod;
     const name = pod.metadata.name;
     let body: RunRequest = { instruction: DEFAULT_INSTRUCTION };
     try {
@@ -415,7 +400,7 @@ export function createApp(deps: AppDeps) {
       }
       how = "nohup (no tmux on the runner)";
     }
-    await setState(k8s, name, "running", { [ANN.exitCode]: null, [ANN.detail]: null });
+    await setState(k8s, pod, "running", { [ANN.exitCode]: null, [ANN.detail]: null });
     return c.json<RunResponse>({
       ok: true,
       how,
@@ -428,8 +413,9 @@ export function createApp(deps: AppDeps) {
 
   // ---- transcript -------------------------------------------------------
   app.get("/v1/sessions/:id/transcript", async (c) => {
-    const pod = await requirePod(c);
-    if (!pod) return notFound(c);
+    const found = await requirePod(c);
+    if ("res" in found) return found.res;
+    const pod = found.pod;
     const name = pod.metadata.name;
     const file = transcriptPath(workTreeOf(pod), sessionParam(c));
 
@@ -444,8 +430,9 @@ export function createApp(deps: AppDeps) {
 
   // ---- archive (the pull direction) -------------------------------------
   app.get("/v1/sessions/:id/archive", async (c) => {
-    const pod = await requirePod(c);
-    if (!pod) return notFound(c);
+    const found = await requirePod(c);
+    if ("res" in found) return found.res;
+    const pod = found.pod;
     const name = pod.metadata.name;
     const workTree = workTreeOf(pod);
     const dirName = `stepaway-arch-${Date.now()}`;
@@ -473,8 +460,9 @@ export function createApp(deps: AppDeps) {
 
   // ---- env names (names in, names out — values never cross) -------------
   app.get("/v1/sessions/:id/env-names", async (c) => {
-    const pod = await requirePod(c);
-    if (!pod) return notFound(c);
+    const found = await requirePod(c);
+    if ("res" in found) return found.res;
+    const pod = found.pod;
     const names = (c.req.query("names") ?? "")
       .split(",")
       .map((s) => s.trim())
@@ -604,8 +592,23 @@ export function createApp(deps: AppDeps) {
   app.notFound((c) => fail(c, 404, "not found", `no route ${c.req.method} ${c.req.path}`));
   app.onError((e, c) => fail(c, 500, "internal error", e.message));
 
-  async function requirePod(c: Context): Promise<PodObject | null> {
-    return k8s.getPod(podName(sessionParam(c)));
+  /**
+   * The runner pod for `:id`, or the response to send instead.
+   *
+   * Record-aware on purpose: a `building` session is a PVC and nothing else,
+   * so GET /sessions/:id happily returns it while every pod route used to
+   * answer 404 — "no such session" for a session the API had just described.
+   * A session that exists but has no pod yet is a 409, not a 404.
+   */
+  async function requirePod(c: Context): Promise<{ pod: PodObject } | { res: Response }> {
+    const name = podName(sessionParam(c));
+    const pod = await k8s.getPod(name);
+    if (pod) return { pod };
+    const rec = await findSessionRecord(k8s, name);
+    if (rec) {
+      return { res: fail(c, 409, "session is still building", annotationState(rec.object)) as unknown as Response };
+    }
+    return { res: notFound(c) as unknown as Response };
   }
   function notFound(c: Context) {
     return fail(c, 404, "no such session", `no runner pod for ${sessionParam(c)}`);
@@ -615,80 +618,6 @@ export function createApp(deps: AppDeps) {
 }
 
 export type App = ReturnType<typeof createApp>;
-
-/** The configured registry probe, or null when the devcontainer path is off. */
-export function resolveManifestCheck(deps: AppDeps): ManifestCheck | null {
-  if (deps.manifestCheck) return deps.manifestCheck;
-  return deps.config.registry.host ? registryManifestCheck(deps.config.registry) : null;
-}
-
-/**
- * One step of the `building` watch: look at the Job, and either leave the
- * session building, boot its pod from the freshly pushed image, or fail it
- * with the builder's log tail.
- *
- * Deliberately a single idempotent step rather than a loop, so the polling
- * lives in server.ts (next to the pending->ready poll it mirrors) and the
- * tests can drive the transitions without timers.
- */
-export async function advanceBuild(deps: AppDeps, w: BuildWatch): Promise<SessionState | "gone"> {
-  const { k8s, config } = deps;
-  const rec = await findSessionRecord(k8s, w.name);
-  if (!rec) return "gone";
-  // The pod exists: someone already finished this build (or the user recreated
-  // the session). Nothing left to watch.
-  if (rec.kind === "pod") return "pending";
-  const state = rec.object.metadata.annotations?.[ANN.state];
-  if (state !== "building") return (state as SessionState) ?? "gone";
-
-  const job = await k8s.getJob(buildJobName(w.hash)).catch(() => null);
-  let outcome = jobOutcome(job);
-  if (outcome === "running") return "building";
-  if (outcome === "gone") {
-    // ttlSecondsAfterFinished can reap a *successful* Job before we look. The
-    // registry is the truth: if the image is there, the build worked.
-    const check = resolveManifestCheck(deps);
-    const pushed = check ? await check(w.hash).catch(() => false) : false;
-    outcome = pushed ? "succeeded" : "failed";
-  }
-
-  if (outcome === "succeeded") {
-    await cleanupEnvSpec(k8s, w.hash);
-    const ann = { ...(rec.object.metadata.annotations ?? {}) };
-    const image = ann[ANN.image] || envImageRef(config.registry.host, w.hash);
-    const pullSecret = ann[ANN.pullSecret] || config.registry.pullSecret;
-    const podAnn: Record<string, string> = { ...ann, [ANN.state]: "pending" };
-    delete podAnn[ANN.detail];
-    try {
-      await k8s.createFromYaml(
-        "pods",
-        podManifest({
-          name: w.name,
-          sessionId: w.sessionId,
-          secretName: AUTH_SECRET,
-          ...config.runner,
-          image,
-          imagePullSecrets: pullSecret ? [pullSecret] : [],
-          annotations: podAnn,
-        }),
-      );
-    } catch (e) {
-      await setRecordState(k8s, rec, "failed", { [ANN.detail]: `could not start the runner: ${(e as Error).message}` });
-      return "failed";
-    }
-    // The PVC keeps a stale annotation for a moment; the pod is authoritative
-    // from here on (findSessionRecord prefers it), but keep them consistent.
-    await setRecordState(k8s, rec, "pending", { [ANN.detail]: null });
-    deps.onSessionCreated?.(w.name);
-    return "pending";
-  }
-
-  const detail =
-    (await buildLogTail(k8s, w.hash)) || jobFailureReason(job) || "the devcontainer build failed with no output";
-  await cleanupEnvSpec(k8s, w.hash);
-  await setRecordState(k8s, rec, "failed", { [ANN.detail]: detail.slice(-400) });
-  return "failed";
-}
 
 /** The `:id` path param, always a string. */
 function sessionParam(c: Context): string {

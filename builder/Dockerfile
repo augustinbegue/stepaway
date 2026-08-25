@@ -3,7 +3,11 @@
 # Runs as the main container of the k8s Job the server creates on an env-image
 # cache miss (SPEC-v0.3). It talks to a dind sidecar over
 # DOCKER_HOST=tcp://127.0.0.1:2375, builds the devcontainer described by the
-# files mounted at /spec, and pushes the result to the in-cluster registry.
+# tarball mounted at $ENVSPEC_PATH (under /spec), and pushes the result to the
+# in-cluster registry.
+#
+# node:22-bookworm-slim ships GNU tar >= 1.29; entrypoint.sh relies on its
+# default refusal of ".." and absolute member paths. Re-check on any base bump.
 FROM node:22-bookworm-slim
 
 # docker CLI only (no daemon: that is the dind sidecar's job) + the bits the

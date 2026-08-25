@@ -1,6 +1,6 @@
 {
   "name": "stepaway",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Move a live Claude Code session between your laptop and a runner pod on your own cluster.",
   "license": "AGPL-3.0-only",
   "type": "module",

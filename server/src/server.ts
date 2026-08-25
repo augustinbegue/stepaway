@@ -8,11 +8,12 @@
  * still pending gets re-probed the next time anyone reads it.
  */
 
-import { advanceBuild, createApp, type AppDeps, type BuildWatch } from "./app.js";
+import { createApp } from "./app.js";
 import { loadConfig, VERSION } from "./config.js";
 import { RestK8s, type K8s } from "./k8s.js";
 import { bashLine } from "./sh.js";
 import { ANN } from "./sessions.js";
+import { advanceBuild, buildJobName, cleanupEnvSpec, type AppDeps, type BuildWatch } from "./build.js";
 
 const READY_POLL_MS = 3_000;
 const READY_TIMEOUT_MS = 10 * 60_000;
@@ -58,11 +59,17 @@ const BUILD_TIMEOUT_MS = 30 * 60_000;
  * reads everything it needs from the cluster, so a backend restart only costs
  * the session the delay until someone calls advanceBuild again.
  */
-export function pollBuild(deps: AppDeps, watch: BuildWatch): void {
-  const deadline = Date.now() + BUILD_TIMEOUT_MS;
-  void (async () => {
+export function pollBuild(
+  deps: AppDeps,
+  watch: BuildWatch,
+  opts: { pollMs?: number; timeoutMs?: number } = {},
+): Promise<void> {
+  const pollMs = opts.pollMs ?? BUILD_POLL_MS;
+  const timeoutMs = opts.timeoutMs ?? BUILD_TIMEOUT_MS;
+  const deadline = Date.now() + timeoutMs;
+  return (async () => {
     for (;;) {
-      await new Promise((r) => setTimeout(r, BUILD_POLL_MS));
+      await new Promise((r) => setTimeout(r, pollMs));
       try {
         const state = await advanceBuild(deps, watch);
         if (state !== "building") return;
@@ -70,10 +77,16 @@ export function pollBuild(deps: AppDeps, watch: BuildWatch): void {
         console.warn(`stepaway: build watch ${watch.hash} failed a step: ${(e as Error).message}`);
       }
       if (Date.now() > deadline) {
+        // Timing out is a terminal path like any other, so it owes the same
+        // cleanup: the envspec Secret nothing else will reap, and the Job
+        // itself — its dind sidecar is privileged and would otherwise burn a
+        // node until activeDeadlineSeconds.
+        await cleanupEnvSpec(deps.k8s, watch.hash);
+        await deps.k8s.deleteJob(buildJobName(watch.hash)).catch(() => undefined);
         await deps.k8s
           .patchPvcAnnotations(watch.name, {
             [ANN.state]: "failed",
-            [ANN.detail]: `the env build did not finish within ${Math.round(BUILD_TIMEOUT_MS / 60_000)}m`,
+            [ANN.detail]: `the env build did not finish within ${Math.round(timeoutMs / 60_000)}m`,
           })
           .catch(() => undefined);
         return;
@@ -92,7 +105,7 @@ async function main(): Promise<void> {
     k8s,
     config,
     onSessionCreated: (pod) => pollUntilReady(k8s, pod),
-    onBuildStarted: (watch) => pollBuild(deps, watch),
+    onBuildStarted: (watch) => void pollBuild(deps, watch),
   };
   const app = createApp(deps);
   if (config.registry.host) {

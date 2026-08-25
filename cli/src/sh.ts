@@ -160,3 +160,25 @@ export function spawnStream(
     process.on("SIGTERM", stop);
   });
 }
+
+/**
+ * Byte sizes for humans. Binary units throughout (KiB/MiB/GiB/TiB), because
+ * every limit stepaway prints next to one — the 1 MiB envSpec cap most of all —
+ * is a power of two, and "1.00 MiB" next to "limit 1.00 MiB" is the only
+ * rendering that does not look like a rounding bug.
+ *
+ * The single formatter in the CLI: sizes are compared across capture, docker
+ * and envspec output, so they must all read the same.
+ */
+export function human(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KiB", "MiB", "GiB", "TiB"];
+  let b = bytes / 1024;
+  let i = 0;
+  while (b >= 1024 && i < units.length - 1) {
+    b /= 1024;
+    i++;
+  }
+  // whole KiB (sub-KiB precision is noise); two decimals from MiB up.
+  return i === 0 ? `${Math.round(b)} KiB` : `${b.toFixed(2)} ${units[i]}`;
+}

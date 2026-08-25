@@ -2,7 +2,9 @@
 # stepaway devcontainer builder.
 #
 # Contract (frozen, SPEC-v0.3):
-#   /spec           the captured .devcontainer files (Secret mount, read-only)
+#   $ENVSPEC_PATH   the captured .devcontainer files as a single tar.gz, inside
+#                   the read-only /spec Secret mount. This is the ONLY accepted
+#                   transport form.
 #   $IMAGE_REF      full ref to build and push, e.g. reg.example.com/stepaway-env:env-<hash>
 #   $REGISTRY_HOST  registry to log into (host[:port], no scheme)
 #   $REGISTRY_USER / $REGISTRY_PASS
@@ -31,6 +33,20 @@ die() {
 [ -n "${REGISTRY_PASS:-}" ] || die "REGISTRY_PASS is not set"
 [ -d /spec ] || die "/spec is not mounted; nothing to build"
 
+# The frozen contract is one tarball at $ENVSPEC_PATH. The glob is a courtesy
+# fallback for hand-run builds only, and says so loudly.
+SPEC_TGZ="${ENVSPEC_PATH:-}"
+if [ -z "$SPEC_TGZ" ]; then
+  for candidate in /spec/*.tgz /spec/*.tar.gz; do
+    [ -f "$candidate" ] || continue
+    SPEC_TGZ="$candidate"
+    log "WARNING: ENVSPEC_PATH is not set; falling back to $SPEC_TGZ (not the frozen contract)"
+    break
+  done
+fi
+[ -n "$SPEC_TGZ" ] || die "ENVSPEC_PATH is not set and no *.tgz was found in /spec; nothing to build"
+[ -f "$SPEC_TGZ" ] || die "env spec tarball $SPEC_TGZ does not exist (is the env-spec Secret mounted at /spec?)"
+
 # --- wait for the dind sidecar ---------------------------------------------
 log "waiting for docker at $DOCKER_HOST (timeout ${DIND_TIMEOUT}s)"
 deadline=$(( $(date +%s) + DIND_TIMEOUT ))
@@ -50,23 +66,32 @@ if ! printf '%s' "$REGISTRY_PASS" |
 fi
 log "logged in to $REGISTRY_HOST as $REGISTRY_USER"
 
-# --- normalise the workspace folder ----------------------------------------
-# The devcontainer CLI looks for <folder>/.devcontainer/devcontainer.json or
-# <folder>/.devcontainer.json. /spec may arrive in either layout (and, as a
-# Secret mount, is read-only and made of symlinks), so everything is copied
-# into a scratch dir first and then arranged into the canonical layout.
+# --- unpack the env spec ----------------------------------------------------
+# Path traversal is refused twice over:
+#   1. GNU tar >= 1.29 (what this image's base ships) strips/refuses ".." and
+#      absolute member paths by default. PINNED ASSUMPTION: swapping the base
+#      image for one with busybox tar or bsdtar would silently weaken this, so
+#      any base-image bump must re-check `tar --version`.
+#   2. symlink and hardlink members are refused outright below, because tar
+#      happily writes *through* a symlink member on a later extract step,
+#      which would let a spec plant a link to /etc and then overwrite it.
+log "reading env spec from $SPEC_TGZ"
+listing=$(tar -tvzf "$SPEC_TGZ") || die "could not read $SPEC_TGZ (not a gzip tar archive?)"
+links=$(printf '%s\n' "$listing" | grep -E '^[lh]' || true)
+if [ -n "$links" ]; then
+  die "env spec contains symlink/hardlink members, which are never legitimate here: $(printf '%s' "$links" | tr '\n' ';')"
+fi
+
+# Fresh, empty extraction dir: no leftovers from a previous run, nothing from
+# the Secret mount other than what the tarball itself carries.
 rm -rf "$WORKDIR"
 mkdir -p "$WORKDIR"
-cp -rL /spec/. "$WORKDIR"/ 2>/dev/null || die "could not copy /spec into $WORKDIR"
+tar -xzf "$SPEC_TGZ" -C "$WORKDIR" || die "could not extract $SPEC_TGZ into $WORKDIR"
 
-# Optional transport form: a single tarball of the .devcontainer files.
-for tarball in "$WORKDIR"/*.tgz "$WORKDIR"/*.tar.gz; do
-  [ -f "$tarball" ] || continue
-  log "extracting $(basename "$tarball")"
-  tar -xzf "$tarball" -C "$WORKDIR" || die "could not extract $(basename "$tarball")"
-  rm -f "$tarball"
-done
-
+# --- normalise the workspace folder ----------------------------------------
+# The devcontainer CLI looks for <folder>/.devcontainer/devcontainer.json or
+# <folder>/.devcontainer.json. The tarball may carry either layout, or a
+# flattened one, so the extracted content is arranged into a canonical layout.
 if [ -f "$WORKDIR/.devcontainer/devcontainer.json" ]; then
   log "layout: .devcontainer/devcontainer.json"
 elif [ -f "$WORKDIR/.devcontainer.json" ]; then
@@ -75,13 +100,13 @@ elif [ -f "$WORKDIR/devcontainer.json" ]; then
   # Flattened delivery (Secret keys cannot contain "/"): promote it.
   log "layout: flat devcontainer.json, promoting to .devcontainer/"
   mkdir -p "$WORKDIR/.devcontainer"
-  for f in "$WORKDIR"/*; do
-    [ -e "$f" ] || continue
-    [ "$f" = "$WORKDIR/.devcontainer" ] && continue
-    mv "$f" "$WORKDIR/.devcontainer/"
-  done
+  # find, not a glob: dotfiles (.dockerignore, .env, ...) must travel too.
+  find "$WORKDIR" -mindepth 1 -maxdepth 1 ! -name .devcontainer -print0 |
+    while IFS= read -r -d '' f; do
+      mv "$f" "$WORKDIR/.devcontainer/" || exit 1
+    done || die "could not promote flat spec files into $WORKDIR/.devcontainer"
 else
-  die "no devcontainer.json found in /spec (looked for .devcontainer/devcontainer.json, .devcontainer.json, devcontainer.json)"
+  die "no devcontainer.json in $SPEC_TGZ (looked for .devcontainer/devcontainer.json, .devcontainer.json, devcontainer.json)"
 fi
 
 # --- build ------------------------------------------------------------------

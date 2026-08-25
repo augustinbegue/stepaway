@@ -9,7 +9,7 @@ import type { RunnerOverrides } from "@stepaway/core";
  * Kept as a literal so the bundled single-file image has no filesystem lookup;
  * server/test/version.test.ts fails the build if it drifts from package.json.
  */
-export const VERSION = "0.4.0";
+export const VERSION = "0.4.1";
 
 /**
  * SPEC-v0.3 "Registry component": the four names below are frozen and set by

@@ -5,7 +5,7 @@ import { detectSetup } from "../setup.js";
 import { findComposeFile } from "../docker.js";
 import { readClientConfig } from "../clientconfig.js";
 import { Ui } from "../ui.js";
-import { previewRunnerEnv } from "../envspec.js";
+import { describeRunnerEnv, resolveRunnerEnv } from "../envspec.js";
 
 /**
  * Write `.stepaway.json`. v0.2: no namespace/pod/context — the CLI addresses a
@@ -37,7 +37,7 @@ export async function cmdInit(args: string[], flags: Record<string, any>): Promi
   patchConfig(root, patch);
 
   const setup = cfg.setup ?? detectSetup(root);
-  const env = previewRunnerEnv(root, cfg.image);
+  const env = describeRunnerEnv(resolveRunnerEnv(root, cfg.image));
   const global = readClientConfig();
   if (flags.json) {
     ui.raw(JSON.stringify({ path: p, updated: existed, config: loadConfig(root) }, null, 2) + "\n");
