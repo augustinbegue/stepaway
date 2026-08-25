@@ -22,7 +22,9 @@ rules:
   # Per-session workspace storage.
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
-    verbs: ["get", "list", "create", "delete"]
+    # patch: pre-pod `building` sessions store their state as PVC annotations
+    # (SPEC-v0.3) — without it every devcontainer session wedges immediately.
+    verbs: ["get", "list", "create", "delete", "patch"]
   # Auth/env-carry secrets minted per session (stepaway-auth pattern), plus
   # the per-build envspec Secrets, which the backend also deletes.
   - apiGroups: [""]

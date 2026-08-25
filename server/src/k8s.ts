@@ -88,7 +88,7 @@ export interface K8s {
   podLogs(name: string, opts?: { container?: string; tailLines?: number }): Promise<string>;
   listStorageClasses(): Promise<StorageClassProbe>;
   /** SelfSubjectAccessReview; false when the review itself is refused. */
-  canI(verb: string, resource: string, subresource?: string): Promise<boolean>;
+  canI(verb: string, resource: string, subresource?: string, group?: string): Promise<boolean>;
   exec(pod: string, command: string[], opts?: ExecOpts): Promise<ExecResult>;
   /**
    * stdout of the remote process as a stream; cancelling closes the socket.
@@ -333,12 +333,12 @@ export class RestK8s implements K8s {
     return { ok: true, forbidden: false, names: items.map((i) => i.metadata.name) };
   }
 
-  async canI(verb: string, resource: string, subresource?: string): Promise<boolean> {
+  async canI(verb: string, resource: string, subresource?: string, group?: string): Promise<boolean> {
     try {
       const body = JSON.stringify({
         apiVersion: "authorization.k8s.io/v1",
         kind: "SelfSubjectAccessReview",
-        spec: { resourceAttributes: { namespace: this.namespace, verb, resource, subresource } },
+        spec: { resourceAttributes: { namespace: this.namespace, verb, resource, subresource, group } },
       });
       const res = await this.json<{ status?: { allowed?: boolean } }>(
         "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews",

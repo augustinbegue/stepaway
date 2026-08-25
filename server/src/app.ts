@@ -508,7 +508,7 @@ export function createApp(deps: AppDeps) {
   app.get("/v1/diagnostics", async (c) => {
     const checks: DiagnosticCheck[] = [];
 
-    const rbac: [string, string, string | undefined][] = [
+    const rbac: [string, string, string | undefined, string?][] = [
       ["create", "pods", undefined],
       ["delete", "pods", undefined],
       ["create", "pods", "exec"],
@@ -516,16 +516,19 @@ export function createApp(deps: AppDeps) {
       ["create", "secrets", undefined],
       // SPEC-v0.3 RBAC additions: only required when the devcontainer path is
       // actually enabled, so a registry-less install is not told it is broken.
+      ["patch", "persistentvolumeclaims", undefined],
       ...(config.registry.host
         ? ([
-            ["create", "jobs", undefined],
+            // jobs live in the batch group — an SSAR without it checks the
+            // (nonexistent) core-group "jobs" and always denies.
+            ["create", "jobs", undefined, "batch"],
             ["delete", "secrets", undefined],
-          ] as [string, string, string | undefined][])
+          ] as [string, string, string | undefined, string?][])
         : []),
     ];
     const missing: string[] = [];
-    for (const [verb, resource, sub] of rbac) {
-      if (!(await k8s.canI(verb, resource, sub))) missing.push(`${verb} ${resource}${sub ? `/${sub}` : ""}`);
+    for (const [verb, resource, sub, group] of rbac) {
+      if (!(await k8s.canI(verb, resource, sub, group))) missing.push(`${verb} ${resource}${sub ? `/${sub}` : ""}`);
     }
     checks.push({
       name: "rbac",
