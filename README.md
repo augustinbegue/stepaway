@@ -63,19 +63,6 @@ cd ~/code/my-project && stepaway push
 | `packages/core` | shared logic: API contract, transcript reader, capture/restore, pod templates |
 | `charts/stepaway` | Helm chart: backend, RBAC, opt-in quotas/limits/network policies |
 
-## Documentation
-
-The [`docs/`](./docs/) directory holds the architecture record: the
-[overview](./docs/architecture/overview.md), the
-[session lifecycle](./docs/architecture/session-lifecycle.md), the
-[handoff flow](./docs/architecture/handoff-flow.md), the
-[environment build](./docs/architecture/environment-build.md), the
-[security](./docs/architecture/security.md) posture and the
-[decision records](./docs/decisions/README.md).
-
-These documents use ASD-STE100 Simplified Technical English. They are the
-record of the design decisions. A change to the architecture must update them.
-
 ## Development
 
 ```sh
