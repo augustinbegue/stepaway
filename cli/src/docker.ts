@@ -1,11 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { run, runAsync, shq, which } from "./sh.js";
+import { lastLine, run, runAsync, shq, which } from "./sh.js";
 import type { DockerManifest } from "@stepaway/core";
-
-// Moved to @stepaway/core in v0.2 (the backend runs it too); re-exported here
-// so the CLI's own call sites keep their import.
-export { DOCKER_RESTORE_SH } from "@stepaway/core";
 
 /**
  * Docker carry (spec §3, POC D3 verbatim).
@@ -170,7 +166,7 @@ export async function captureDocker(
       `set -o pipefail; docker run --rm -v ${shq(v)}:/v:ro ${HELPER_IMAGE} tar czf - -C /v . > ${shq(dest)}`,
     ]);
     if (r.code !== 0) {
-      warnings.push(`could not archive volume ${v}: ${(r.stderr || r.stdout).trim().split("\n").pop()}`);
+      warnings.push(`could not archive volume ${v}: ${lastLine(r.stderr || r.stdout)}`);
       fs.rmSync(dest, { force: true });
       continue;
     }

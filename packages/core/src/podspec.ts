@@ -35,6 +35,11 @@ export type RunnerOverrides = {
   memoryLimit?: string;
   storageClass?: string;
   storageSize?: string;
+  /**
+   * Docker-in-Docker sidecar. Default true; false drops the privileged `dind`
+   * container and its storage volume (clusters that refuse privileged pods).
+   */
+  dindEnabled?: boolean;
   /** extra pod annotations (the backend stores session state in these). */
   annotations?: Record<string, string>;
 };
@@ -78,6 +83,32 @@ export function podManifest(o: PodOpts): string {
             secretKeyRef:
               name: ${secret}
               key: ${AUTH_SECRET_KEY}
+`
+    : "";
+  const dind = o.dindEnabled !== false;
+  const dindContainer = dind
+    ? `    - name: dind
+      image: docker:dind
+      securityContext:
+        privileged: true
+      # dockerd directly: the dind entrypoint adds its own 0.0.0.0:2375 listener
+      # when TLS is off (duplicate bind), and loopback-only keeps the daemon off
+      # the pod IP.
+      command: ["dockerd", "--host=tcp://127.0.0.1:2375", "--host=unix:///var/run/docker.sock"]
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          memory: 4Gi
+      volumeMounts:
+        - name: dind-storage
+          mountPath: /var/lib/docker
+`
+    : "";
+  const dindVolume = dind
+    ? `    - name: dind-storage
+      emptyDir: {}
 `
     : "";
   return `apiVersion: v1
@@ -142,29 +173,10 @@ ${tokenEnv}      readinessProbe:
           mountPath: /work
         - name: repo
           mountPath: /repo
-    - name: dind
-      image: docker:dind
-      securityContext:
-        privileged: true
-      # dockerd directly: the dind entrypoint adds its own 0.0.0.0:2375 listener
-      # when TLS is off (duplicate bind), and loopback-only keeps the daemon off
-      # the pod IP.
-      command: ["dockerd", "--host=tcp://127.0.0.1:2375", "--host=unix:///var/run/docker.sock"]
-      resources:
-        requests:
-          cpu: 100m
-          memory: 256Mi
-        limits:
-          memory: 4Gi
-      volumeMounts:
-        - name: dind-storage
-          mountPath: /var/lib/docker
-  volumes:
+${dindContainer}  volumes:
     - name: work
       emptyDir: {}
-    - name: dind-storage
-      emptyDir: {}
-    - name: repo
+${dindVolume}    - name: repo
       persistentVolumeClaim:
         claimName: ${o.name}
 `;

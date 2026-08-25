@@ -165,13 +165,12 @@ import * as path15 from "node:path";
 
 // src/commands/push.ts
 import { randomUUID } from "node:crypto";
-import * as fs9 from "node:fs";
+import * as fs8 from "node:fs";
 import * as os2 from "node:os";
 import * as path9 from "node:path";
 
 // src/sh.ts
 import { spawn, spawnSync } from "node:child_process";
-import * as fs from "node:fs";
 function run(cmd, args, opts = {}) {
   const r = spawnSync(cmd, args, {
     cwd: opts.cwd,
@@ -235,44 +234,16 @@ function runAsync(cmd, args, opts = {}) {
 function bashAsync(script, args = [], opts = {}) {
   return runAsync("bash", ["-c", script, "stepaway", ...args], opts);
 }
+function lastLine(s) {
+  const lines = s.trim().split(`
+`).filter((l) => l.trim());
+  return lines.length ? lines[lines.length - 1] : "(no output)";
+}
 function which(bin) {
   return run("bash", ["-lc", `command -v ${shq(bin)} >/dev/null 2>&1`]).code === 0;
 }
 function shq(s) {
   return `'${s.replace(/'/g, `'\\''`)}'`;
-}
-function isTTY() {
-  return Boolean(process.stdin.isTTY && process.stdout.isTTY);
-}
-function ask(question) {
-  process.stdout.write(question);
-  const buf = Buffer.alloc(4096);
-  let out = "";
-  let fd;
-  try {
-    fd = fs.openSync("/dev/tty", "rs");
-  } catch {
-    fd = 0;
-  }
-  for (;; ) {
-    let n = 0;
-    try {
-      n = fs.readSync(fd, buf, 0, buf.length, null);
-    } catch {
-      break;
-    }
-    if (n <= 0)
-      break;
-    out += buf.toString("utf8", 0, n);
-    if (out.includes(`
-`))
-      break;
-  }
-  return out.replace(/\r?\n[\s\S]*$/, "");
-}
-function confirm(question) {
-  const ans = ask(question).trim().toLowerCase();
-  return ans === "y" || ans === "yes";
 }
 
 // ../node_modules/.bun/@clack+core@1.4.3/node_modules/@clack/core/dist/index.mjs
@@ -1569,7 +1540,7 @@ var limitOptions = ({
       x.push(n2);
   return c2 && x.push(M2), x;
 };
-var confirm2 = (i) => {
+var confirm = (i) => {
   const a2 = i.active ?? "Yes", s = i.inactive ?? "No";
   return new r({
     active: a2,
@@ -1917,6 +1888,9 @@ class Ui {
     this.verbose = Boolean(opts.verbose);
     this.fancy = !opts.plain && isTTYOut();
   }
+  get interactive() {
+    return Boolean(process.stdin.isTTY && process.stdout.isTTY);
+  }
   static from(flags) {
     return new Ui({ verbose: Boolean(flags.verbose), plain: Boolean(flags.yes || flags.json) });
   }
@@ -2048,15 +2022,15 @@ class Ui {
     };
   }
   async confirm(question, fallback) {
-    if (!this.fancy || !process.stdin.isTTY)
+    if (!this.fancy || !this.interactive)
       return fallback;
-    const a2 = await confirm2({ message: question, initialValue: false });
+    const a2 = await confirm({ message: question, initialValue: false });
     if (isCancel(a2))
       return false;
     return Boolean(a2);
   }
   async multiselect(question, options, fallback) {
-    if (!this.fancy || !process.stdin.isTTY || !options.length)
+    if (!this.fancy || !this.interactive || !options.length)
       return fallback;
     const a2 = await multiselect({
       message: question,
@@ -2069,7 +2043,7 @@ class Ui {
     return a2;
   }
   async text(question, placeholder) {
-    if (!this.fancy || !process.stdin.isTTY)
+    if (!this.fancy || !this.interactive)
       return "";
     const a2 = await text({ message: question, placeholder, defaultValue: "" });
     if (isCancel(a2))
@@ -2631,6 +2605,21 @@ if [ -n "$COMPOSE" ] && [ -f "$WT/$COMPOSE" ]; then
   fi
 fi
 `;
+// ../packages/core/src/run.ts
+var DEFAULT_INSTRUCTION = "You were handed off mid-task to a runner. Review the last few turns and the working tree, then continue the task in progress.";
+var DEFAULT_REMOTE_BASE = "/work";
+function stepawayDir(remoteBase = DEFAULT_REMOTE_BASE) {
+  const base = (remoteBase || DEFAULT_REMOTE_BASE).replace(/\/+$/, "") || "";
+  return `${base}/.stepaway`;
+}
+function runLogPath(remoteBase = DEFAULT_REMOTE_BASE) {
+  return `${stepawayDir(remoteBase)}/run.log`;
+}
+function exitMarkerPath(remoteBase = DEFAULT_REMOTE_BASE) {
+  return `${stepawayDir(remoteBase)}/exit-code`;
+}
+var RUN_LOG = runLogPath();
+var EXIT_MARKER = exitMarkerPath();
 // ../packages/core/src/transcript.ts
 function contentBlocks(obj) {
   const c3 = obj?.message?.content ?? obj?.content;
@@ -2732,16 +2721,16 @@ var ROUTES = {
   version: `${API_PREFIX}/version`
 };
 // src/config.ts
-import * as fs4 from "node:fs";
+import * as fs3 from "node:fs";
 import * as path4 from "node:path";
 
 // src/client.ts
-import * as fs2 from "node:fs";
+import * as fs from "node:fs";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
 // src/version.ts
-var VERSION = "0.3.0";
+var VERSION = "0.3.1";
 
 // src/client.ts
 class ApiError extends Error {
@@ -2913,8 +2902,8 @@ class Client {
     }
   }
   async uploadCapture(id, tarPath, setup) {
-    const size = fs2.statSync(tarPath).size;
-    const web = Readable.toWeb(fs2.createReadStream(tarPath));
+    const size = fs.statSync(tarPath).size;
+    const web = Readable.toWeb(fs.createReadStream(tarPath));
     const res = await this.fetch(ROUTES.capture(id), {
       method: "POST",
       query: setup ? { setup } : undefined,
@@ -2923,8 +2912,9 @@ class Client {
       duplex: "half"
     });
     const text2 = await res.text();
-    if (!text2.trim())
-      return emptyReport();
+    if (!text2.trim()) {
+      throw new ApiError("backend returned an empty body from /capture", res.status, "expected a CaptureReport");
+    }
     try {
       return JSON.parse(text2);
     } catch {
@@ -2935,9 +2925,9 @@ class Client {
     const res = await this.fetch(ROUTES.archive(id));
     if (!res.body)
       throw new ApiError("backend sent an empty archive", res.status);
-    const out = fs2.createWriteStream(destPath);
+    const out = fs.createWriteStream(destPath);
     await pipeline(Readable.fromWeb(res.body), out);
-    return fs2.statSync(destPath).size;
+    return fs.statSync(destPath).size;
   }
   async transcript(id) {
     const res = await this.fetch(ROUTES.transcript(id));
@@ -2984,22 +2974,12 @@ class Client {
       flushEvent(buf);
   }
 }
-function emptyReport() {
-  return {
-    restored: true,
-    gitDir: "",
-    workTree: "",
-    branch: "",
-    docker: { attempted: false, ok: true },
-    setup: { attempted: false, ok: true }
-  };
-}
 function sleep(ms) {
   return new Promise((r2) => setTimeout(r2, ms));
 }
 
 // src/clientconfig.ts
-import * as fs3 from "node:fs";
+import * as fs2 from "node:fs";
 import * as os from "node:os";
 import * as path3 from "node:path";
 function configHome(env2 = process.env, home = os.homedir()) {
@@ -3011,10 +2991,10 @@ function clientConfigPath(env2 = process.env, home = os.homedir()) {
 }
 function readClientConfig() {
   const p2 = clientConfigPath();
-  if (!fs3.existsSync(p2))
+  if (!fs2.existsSync(p2))
     return {};
   try {
-    const o2 = JSON.parse(fs3.readFileSync(p2, "utf8"));
+    const o2 = JSON.parse(fs2.readFileSync(p2, "utf8"));
     if (!o2 || typeof o2 !== "object")
       return {};
     return {
@@ -3027,11 +3007,11 @@ function readClientConfig() {
 }
 function writeClientConfig(cfg) {
   const p2 = clientConfigPath();
-  fs3.mkdirSync(path3.dirname(p2), { recursive: true, mode: 448 });
-  fs3.writeFileSync(p2, JSON.stringify(cfg, null, 2) + `
+  fs2.mkdirSync(path3.dirname(p2), { recursive: true, mode: 448 });
+  fs2.writeFileSync(p2, JSON.stringify(cfg, null, 2) + `
 `, { mode: 384 });
   try {
-    fs3.chmodSync(p2, 384);
+    fs2.chmodSync(p2, 384);
   } catch {}
   return p2;
 }
@@ -3085,10 +3065,10 @@ function configPath(root) {
 }
 function loadRawConfig(root) {
   const p2 = configPath(root);
-  if (!fs4.existsSync(p2))
+  if (!fs3.existsSync(p2))
     return {};
   try {
-    const o2 = JSON.parse(fs4.readFileSync(p2, "utf8"));
+    const o2 = JSON.parse(fs3.readFileSync(p2, "utf8"));
     return o2 && typeof o2 === "object" ? o2 : {};
   } catch (e) {
     throw new Error(`${p2} is not valid JSON: ${e.message}`);
@@ -3115,7 +3095,7 @@ function patchConfig(root, patch) {
   const raw = loadRawConfig(root);
   const next = { ...raw, ...patch };
   const p2 = configPath(root);
-  fs4.writeFileSync(p2, JSON.stringify(next, null, 2) + `
+  fs3.writeFileSync(p2, JSON.stringify(next, null, 2) + `
 `);
   return p2;
 }
@@ -3144,38 +3124,38 @@ function batonPath(root) {
 }
 function readBaton(root) {
   const p2 = batonPath(root);
-  if (!fs4.existsSync(p2))
+  if (!fs3.existsSync(p2))
     return null;
   try {
-    return JSON.parse(fs4.readFileSync(p2, "utf8"));
+    return JSON.parse(fs3.readFileSync(p2, "utf8"));
   } catch {
     return null;
   }
 }
 function writeBaton(root, b2) {
-  fs4.mkdirSync(path4.dirname(batonPath(root)), { recursive: true });
-  fs4.writeFileSync(batonPath(root), JSON.stringify(b2, null, 2) + `
+  fs3.mkdirSync(path4.dirname(batonPath(root)), { recursive: true });
+  fs3.writeFileSync(batonPath(root), JSON.stringify(b2, null, 2) + `
 `);
 }
 function clearBaton(root) {
   try {
-    fs4.rmSync(batonPath(root));
+    fs3.rmSync(batonPath(root));
   } catch {}
 }
 
 // src/capture.ts
-import * as fs5 from "node:fs";
+import * as fs4 from "node:fs";
 import * as path5 from "node:path";
 function readMeta(dir, name, dflt = "") {
   try {
-    return fs5.readFileSync(path5.join(dir, "meta", name), "utf8").trim();
+    return fs4.readFileSync(path5.join(dir, "meta", name), "utf8").trim();
   } catch {
     return dflt;
   }
 }
 function readLines(dir, rel) {
   try {
-    return fs5.readFileSync(path5.join(dir, rel), "utf8").split(`
+    return fs4.readFileSync(path5.join(dir, rel), "utf8").split(`
 `).map((l2) => l2.trim()).filter(Boolean);
   } catch {
     return [];
@@ -3183,7 +3163,7 @@ function readLines(dir, rel) {
 }
 function readCaptureFacts(captureDir) {
   const sessionsDir = path5.join(captureDir, "sessions");
-  const sessionIds = fs5.existsSync(sessionsDir) ? fs5.readdirSync(sessionsDir).filter((f2) => f2.endsWith(".jsonl")).map((f2) => f2.replace(/\.jsonl$/, "")).sort() : [];
+  const sessionIds = fs4.existsSync(sessionsDir) ? fs4.readdirSync(sessionsDir).filter((f2) => f2.endsWith(".jsonl")).map((f2) => f2.replace(/\.jsonl$/, "")).sort() : [];
   return {
     projectPath: readMeta(captureDir, "project-path"),
     slug: readMeta(captureDir, "slug"),
@@ -3200,12 +3180,12 @@ function readCaptureFacts(captureDir) {
 }
 function buildManifest(captureDir, extras = {}) {
   const m3 = composeManifest(readCaptureFacts(captureDir), extras);
-  fs5.writeFileSync(path5.join(captureDir, "manifest.json"), JSON.stringify(m3, null, 2) + `
+  fs4.writeFileSync(path5.join(captureDir, "manifest.json"), JSON.stringify(m3, null, 2) + `
 `);
   return m3;
 }
 async function captureLocal(projectDir, outDir, opts = {}) {
-  fs5.mkdirSync(outDir, { recursive: true });
+  fs4.mkdirSync(outDir, { recursive: true });
   const env2 = {
     ...process.env,
     STEPAWAY_EXCLUDES: (opts.excludes ?? []).join(`
@@ -3219,7 +3199,7 @@ ${r2.stderr.trim() || r2.stdout.trim()}`);
 }
 function existingSlugDir(home, projectPath) {
   for (const c3 of slugCandidates(projectPath)) {
-    if (fs5.existsSync(path5.join(home, ".claude", "projects", c3)))
+    if (fs4.existsSync(path5.join(home, ".claude", "projects", c3)))
       return c3;
   }
   return null;
@@ -3231,13 +3211,13 @@ function selectSession(home, projectPath, want) {
   const dir = path5.join(home, ".claude", "projects", slug);
   let entries = [];
   try {
-    entries = fs5.readdirSync(dir).filter((f2) => f2.endsWith(".jsonl"));
+    entries = fs4.readdirSync(dir).filter((f2) => f2.endsWith(".jsonl"));
   } catch {
     return null;
   }
   const listed = entries.flatMap((f2) => {
     try {
-      return [{ id: f2.replace(/\.jsonl$/, ""), mtimeMs: fs5.statSync(path5.join(dir, f2)).mtimeMs }];
+      return [{ id: f2.replace(/\.jsonl$/, ""), mtimeMs: fs4.statSync(path5.join(dir, f2)).mtimeMs }];
     } catch {
       return [];
     }
@@ -3246,14 +3226,14 @@ function selectSession(home, projectPath, want) {
 }
 function rewriteSessions(captureDir, srcPath, dstPath) {
   const dir = path5.join(captureDir, "sessions");
-  if (!fs5.existsSync(dir))
+  if (!fs4.existsSync(dir))
     return { files: 0, trimmed: 0 };
   let trimmed = 0;
   let files = 0;
-  for (const f2 of fs5.readdirSync(dir).filter((f3) => f3.endsWith(".jsonl"))) {
+  for (const f2 of fs4.readdirSync(dir).filter((f3) => f3.endsWith(".jsonl"))) {
     const p2 = path5.join(dir, f2);
-    const out = rewriteTranscript(fs5.readFileSync(p2, "utf8"), srcPath, dstPath);
-    fs5.writeFileSync(p2, out.text);
+    const out = rewriteTranscript(fs4.readFileSync(p2, "utf8"), srcPath, dstPath);
+    fs4.writeFileSync(p2, out.text);
     trimmed += out.trimmed;
     files++;
   }
@@ -3261,7 +3241,7 @@ function rewriteSessions(captureDir, srcPath, dstPath) {
 }
 
 // src/envcarry.ts
-import * as fs6 from "node:fs";
+import * as fs5 from "node:fs";
 import * as path6 from "node:path";
 function carryEnvFiles(root, captureDir, declared, plan) {
   const outBase = path6.join(captureDir, "envfiles");
@@ -3274,15 +3254,15 @@ function carryEnvFiles(root, captureDir, declared, plan) {
   let first = true;
   for (const rel of carryList) {
     const src = path6.join(root, rel);
-    if (!fs6.existsSync(src))
+    if (!fs5.existsSync(src))
       continue;
-    const filtered = filterEnvFile(fs6.readFileSync(src, "utf8"), plan.excludeVars, plan.overrideVars, {
+    const filtered = filterEnvFile(fs5.readFileSync(src, "utf8"), plan.excludeVars, plan.overrideVars, {
       appendMissing: first
     });
     first = false;
     const dst = path6.join(outBase, rel);
-    fs6.mkdirSync(path6.dirname(dst), { recursive: true });
-    fs6.writeFileSync(dst, filtered.text, { mode: 384 });
+    fs5.mkdirSync(path6.dirname(dst), { recursive: true });
+    fs5.writeFileSync(dst, filtered.text, { mode: 384 });
     for (const k of filtered.kept)
       satisfied.add(k);
     for (const d of filtered.dropped)
@@ -3293,15 +3273,15 @@ function carryEnvFiles(root, captureDir, declared, plan) {
   const leftover = Object.entries(plan.overrideVars).filter(([k]) => !plan.excludeVars.includes(k));
   if (first && leftover.length) {
     const dst = path6.join(outBase, ".env");
-    fs6.mkdirSync(outBase, { recursive: true });
-    fs6.writeFileSync(dst, leftover.map(([k, v]) => `${k}=${v}`).join(`
+    fs5.mkdirSync(outBase, { recursive: true });
+    fs5.writeFileSync(dst, leftover.map(([k, v]) => `${k}=${v}`).join(`
 `) + `
 `, { mode: 384 });
     carried.push({ path: ".env", vars: leftover.length });
   }
   if (carried.length) {
-    fs6.mkdirSync(path6.join(captureDir, "meta"), { recursive: true });
-    fs6.writeFileSync(path6.join(captureDir, "meta", "env-carried.txt"), carried.map((c3) => `${c3.path}	${c3.vars}`).join(`
+    fs5.mkdirSync(path6.join(captureDir, "meta"), { recursive: true });
+    fs5.writeFileSync(path6.join(captureDir, "meta", "env-carried.txt"), carried.map((c3) => `${c3.path}	${c3.vars}`).join(`
 `) + `
 `);
   }
@@ -3309,7 +3289,7 @@ function carryEnvFiles(root, captureDir, declared, plan) {
 }
 function varCount(root, rel) {
   try {
-    return parseVarNames(fs6.readFileSync(path6.join(root, rel), "utf8")).length;
+    return parseVarNames(fs5.readFileSync(path6.join(root, rel), "utf8")).length;
   } catch {
     return 0;
   }
@@ -3345,7 +3325,7 @@ async function resolveEnvPlan(declared, remembered, opts) {
     };
   }
   const ui = opts.ui;
-  if (opts.interactive && ui?.fancy && isTTY() && list.length) {
+  if (opts.interactive && ui?.fancy && ui.interactive && list.length) {
     const picked = await pickEnvFiles(ui, root, list);
     return { plan: { ...picked, overrideVars: {} }, asked: true, declared: list };
   }
@@ -3353,15 +3333,15 @@ async function resolveEnvPlan(declared, remembered, opts) {
 }
 
 // src/docker.ts
-import * as fs7 from "node:fs";
+import * as fs6 from "node:fs";
 import * as path7 from "node:path";
 var HELPER_IMAGE = "alpine";
 var COMPOSE_CANDIDATES = ["compose.yaml", "compose.yml", "docker-compose.yml", "docker-compose.yaml"];
 function findComposeFile(root, configured) {
   if (configured)
-    return fs7.existsSync(path7.join(root, configured)) ? configured : null;
+    return fs6.existsSync(path7.join(root, configured)) ? configured : null;
   for (const c3 of COMPOSE_CANDIDATES)
-    if (fs7.existsSync(path7.join(root, c3)))
+    if (fs6.existsSync(path7.join(root, c3)))
       return c3;
   return null;
 }
@@ -3441,7 +3421,7 @@ async function captureDocker(root, captureDir, plan, log2) {
   const outDir = path7.join(captureDir, "volumes");
   const carried = [];
   if (plan.volumes.length)
-    fs7.mkdirSync(outDir, { recursive: true });
+    fs6.mkdirSync(outDir, { recursive: true });
   for (const v of plan.volumes) {
     if (refusedVolumes.has(v))
       continue;
@@ -3451,14 +3431,13 @@ async function captureDocker(root, captureDir, plan, log2) {
       `set -o pipefail; docker run --rm -v ${shq(v)}:/v:ro ${HELPER_IMAGE} tar czf - -C /v . > ${shq(dest)}`
     ]);
     if (r2.code !== 0) {
-      warnings.push(`could not archive volume ${v}: ${(r2.stderr || r2.stdout).trim().split(`
-`).pop()}`);
-      fs7.rmSync(dest, { force: true });
+      warnings.push(`could not archive volume ${v}: ${lastLine(r2.stderr || r2.stdout)}`);
+      fs6.rmSync(dest, { force: true });
       continue;
     }
     let bytes = 0;
     try {
-      bytes = fs7.statSync(dest).size;
+      bytes = fs6.statSync(dest).size;
     } catch {}
     carried.push({ name: v, bytes });
     log2(`archived volume ${v} (${human(bytes)})
@@ -3480,7 +3459,7 @@ async function captureDocker(root, captureDir, plan, log2) {
     refused,
     orphans: plan.orphans
   };
-  fs7.writeFileSync(path7.join(captureDir, "meta", "docker.json"), JSON.stringify(manifest2, null, 2) + `
+  fs6.writeFileSync(path7.join(captureDir, "meta", "docker.json"), JSON.stringify(manifest2, null, 2) + `
 `);
   return { manifest: manifest2, warnings };
 }
@@ -3498,7 +3477,7 @@ function human(bytes) {
 }
 
 // src/setup.ts
-import * as fs8 from "node:fs";
+import * as fs7 from "node:fs";
 import * as path8 from "node:path";
 var SETUP_TABLE = [
   { marker: "bun.lock", command: "bun install" },
@@ -3509,7 +3488,7 @@ var SETUP_TABLE = [
 ];
 function detectSetup(dir) {
   for (const r2 of SETUP_TABLE) {
-    if (fs8.existsSync(path8.join(dir, r2.marker)))
+    if (fs7.existsSync(path8.join(dir, r2.marker)))
       return r2.command;
   }
   return null;
@@ -3521,7 +3500,6 @@ function resolveSetup(dir, configured) {
 }
 
 // src/commands/push.ts
-var DEFAULT_INSTRUCTION = "You were handed off mid-task to a runner. Review the last few turns and the working tree, then continue the task in progress.";
 var BIG_FILE_BYTES = 50 * 1024 * 1024;
 var LABEL_W = 18;
 function consentSummary(m3, opts) {
@@ -3555,7 +3533,7 @@ function consentSummary(m3, opts) {
     cont(`laptop containers are restarted right after capture`, k.dim);
   }
   row("setup", opts.setup ?? "(none detected)", k.ok);
-  row("agent", `runs autonomously on the runner: ${truncate(opts.instruction, 80)}`, k.ok);
+  row("agent", `runs autonomously on the runner: ${clip(opts.instruction, 80)}`, k.ok);
   L.push("");
   L.push(k.warn(k.bold("does NOT move")));
   row("gitignored files", String(n2.gitignored_files), k.warn);
@@ -3578,15 +3556,243 @@ function quiet(ui) {
       ui.detail(text2);
   };
 }
-function truncate(s, n2) {
-  const one = s.replace(/\s+/g, " ").trim();
-  return one.length <= n2 ? one : one.slice(0, n2 - 1) + "…";
+function planToManifest(plan) {
+  if (!plan)
+    return null;
+  return {
+    compose_file: plan.composeFile,
+    project: plan.project,
+    containers: plan.containers.map((c3) => ({ name: c3.name, image: c3.image, digest: c3.digest })),
+    volumes: plan.volumes.map((v) => ({ name: v, bytes: 0 })),
+    refused: [],
+    orphans: plan.orphans
+  };
 }
+function manifestExtras(x, docker) {
+  return {
+    envFiles: x.env?.carried ?? [],
+    unsatisfied: x.unmet,
+    skippedEnvFiles: x.env?.skipped ?? [],
+    docker
+  };
+}
+var preflightBackend = async (x) => {
+  try {
+    const skew = await x.client.checkVersion();
+    if (skew.fatal) {
+      x.ui.error(skew.message ?? "incompatible backend version");
+      return 1;
+    }
+    if (skew.message)
+      x.ui.warn(skew.message);
+  } catch (e) {
+    x.ui.error(`backend unreachable: ${e.message}`, "check the URL and token, then: stepaway doctor");
+    return 1;
+  }
+  return null;
+};
+var createSession = async (x) => {
+  const boot = x.ui.spinner(`creating session ${x.apiId.slice(0, 8)} on ${x.target}`);
+  x.boot = boot;
+  try {
+    x.session = await x.client.createSession({
+      sessionId: x.apiId,
+      project: path9.basename(x.root),
+      options: { remotePathBase: x.cfg.remotePathBase }
+    });
+  } catch (e) {
+    boot.fail(`could not create the session: ${e.message}`);
+    return 1;
+  }
+  x.arm();
+  return null;
+};
+var capture = async (x) => {
+  x.boot?.update(`runner ${x.session?.podName || x.apiId.slice(0, 8)} booting — capturing ${path9.basename(x.root)} meanwhile`);
+  try {
+    await captureLocal(x.root, x.capDir, { sessionId: x.sid, excludes: x.excludes, composeFile: x.cfg.composeFile });
+  } catch (e) {
+    x.boot?.fail(`capture failed: ${e.message}`);
+    return x.fail("capture failed");
+  }
+  return null;
+};
+var carryEnv = async (x) => {
+  const rawDeclared = readLines(x.capDir, "meta/declared-env-files.txt");
+  x.boot?.stop(`captured ${path9.basename(x.root)}; runner still booting`);
+  x.boot = null;
+  const { plan, asked, declared } = await resolveEnvPlan(rawDeclared, x.cfg.env, {
+    interactive: !x.flags.yes,
+    ui: x.ui,
+    root: x.root
+  });
+  x.env = carryEnvFiles(x.root, x.capDir, declared, plan);
+  if (asked) {
+    const p2 = rememberEnvChoice(x.root, { carryFiles: plan.carryFiles, excludeVars: plan.excludeVars });
+    x.ui.detail(`remembered env choices in ${p2}`);
+  }
+  return null;
+};
+var waitReadyAndCheckVars = async (x) => {
+  const required = readLines(x.capDir, "meta/required-vars.txt");
+  const wait = x.ui.spinner("waiting for the runner (image pull + claude install)");
+  try {
+    const ready = await x.client.waitReady(x.apiId, {
+      onState: (s) => wait.update(`runner ${s.podName || x.apiId.slice(0, 8)}: ${s.state}`)
+    });
+    wait.stop(`runner ${ready.podName || x.apiId.slice(0, 8)} ready`);
+  } catch (e) {
+    wait.fail(e.message);
+    return x.fail("runner never became ready");
+  }
+  let runnerEnv;
+  try {
+    runnerEnv = await x.client.envNames(x.apiId, required);
+  } catch (e) {
+    x.ui.warn(`could not query the runner's env names (${e.message}); assuming none are set`);
+    runnerEnv = new Set;
+  }
+  x.unmet = unsatisfiedVars(required, x.env?.satisfied ?? new Set, runnerEnv);
+  if (x.unmet.length) {
+    x.ui.error(`refusing to hand off: ${x.unmet.length} declared variable(s) would be missing on the runner: ${x.unmet.join(", ")}`, `carry the file that defines them, or set them in .stepaway.json:
+` + `  { "env": { "carryFiles": [...], "overrideVars": { "${x.unmet[0]}": "value" } } }
+` + `nothing was transferred; the empty runner was deleted.`);
+    return x.fail("unsatisfied variables");
+  }
+  return null;
+};
+var planTransfer = async (x) => {
+  x.dplan = planDocker(x.root, x.cfg.composeFile);
+  x.setupCmd = resolveSetup(x.root, x.cfg.setup);
+  x.instruction = x.flags.goal ? String(x.flags.goal) : DEFAULT_INSTRUCTION;
+  x.manifest = buildManifest(x.capDir, manifestExtras(x, planToManifest(x.dplan)));
+  const rw = rewriteSessions(x.capDir, x.manifest.captured.project_path, x.remote);
+  if (rw.trimmed)
+    x.ui.detail(`trimmed ${rw.trimmed} phantom transcript line(s)`);
+  return null;
+};
+var consent = async (x) => {
+  const summary = consentSummary(x.manifest, {
+    remote: x.remote,
+    gitDir: x.gitDir,
+    target: x.target,
+    docker: x.dplan,
+    setup: x.setupCmd,
+    instruction: x.instruction,
+    color: x.ui.fancy,
+    verbose: x.ui.verbose
+  });
+  x.ui.note(summary, "this is what moves");
+  if (!x.flags.yes) {
+    if (!x.ui.interactive) {
+      x.ui.error("refusing to transfer without consent (no TTY)", "re-run with --yes");
+      return x.fail("no consent");
+    }
+    if (!await x.ui.confirm("Hand this session off to the runner?", false)) {
+      x.ui.cancel("aborted — nothing was moved, nothing was stopped, and the empty runner was deleted");
+      return x.fail("declined");
+    }
+  }
+  return null;
+};
+var quiesceDocker = async (x) => {
+  if (!x.dplan)
+    return null;
+  const spin = x.ui.spinner(`quiescing ${x.dplan.containers.length} container(s)`);
+  const dres = await captureDocker(x.root, x.capDir, x.dplan, quiet(x.ui));
+  spin.stop(`services quiesced and volumes carried`);
+  for (const w of dres.warnings)
+    x.ui.warn(w);
+  x.manifest = buildManifest(x.capDir, manifestExtras(x, dres.manifest));
+  return null;
+};
+var transfer = async (x) => {
+  const xfer = x.ui.spinner(`transferring to ${x.target}`);
+  const tr = await bashAsync(`set -e; tar czf ${shq(x.tarPath)} -C ${shq(os2.tmpdir())} ${shq(x.capDirName)}`);
+  if (tr.code !== 0) {
+    xfer.fail(`tar failed: ${lastLine(tr.stderr)}`);
+    return x.fail("tar failed");
+  }
+  try {
+    x.report = await x.client.uploadCapture(x.apiId, x.tarPath, x.setupCmd);
+  } catch (e) {
+    xfer.fail(`upload failed: ${e.message}`);
+    x.disarm();
+    x.ui.error("the session still exists on the backend", `retry, or: stepaway destroy --session ${x.apiId}`);
+    return 1;
+  }
+  xfer.stop(`transferred to ${x.target} and restored on the runner`);
+  x.ui.detail(JSON.stringify(x.report));
+  const report = x.report;
+  if (report && report.restored === false) {
+    x.ui.error("the runner could not restore the capture", `stepaway destroy --session ${x.apiId} to clean up`);
+    x.disarm();
+    return 1;
+  }
+  if (report?.docker && report.docker.attempted && !report.docker.ok) {
+    x.ui.warn(`services did not all come up on the runner${report.docker.detail ? `: ${report.docker.detail}` : ""}`);
+  }
+  if (report?.setup && report.setup.attempted && !report.setup.ok) {
+    x.ui.warn(`setup failed on the runner (${report.setup.cmd ?? x.setupCmd}) — the agent can often fix it`);
+    if (report.setup.tail)
+      x.ui.detail(report.setup.tail);
+  }
+  return null;
+};
+var launch = async (x) => {
+  const spin = x.ui.spinner("starting the unattended run");
+  try {
+    await x.client.run(x.apiId, { instruction: x.instruction });
+    spin.stop("agent running unattended on the runner");
+  } catch (e) {
+    spin.fail(`could not start the run: ${e.message}`);
+    x.ui.error("the runner is up with your code on it", `retry, or: stepaway destroy --session ${x.apiId}`);
+    x.disarm();
+    return 1;
+  }
+  writeBaton(x.root, {
+    pushedAt: new Date().toISOString(),
+    server: x.target,
+    id: x.apiId,
+    sessionId: capturedSessionId(x.manifest) ?? x.sid,
+    remotePath: x.report?.workTree || x.remote
+  });
+  x.disarm();
+  x.ui.outro(`pushed — the cloud is now the source of truth for ${path9.basename(x.root)}
+` + `  watch:       stepaway peek -f
+` + `  bring back:  stepaway pull
+` + `  abandon:     stepaway destroy`);
+  if (x.flags.json) {
+    x.ui.raw(JSON.stringify({
+      ok: true,
+      server: x.target,
+      sessionId: x.apiId,
+      remotePath: x.report?.workTree || x.remote,
+      gitDir: x.gitDir,
+      report: x.report,
+      manifest: x.manifest
+    }, null, 2) + `
+`);
+  }
+  return 0;
+};
+var PHASES = [
+  preflightBackend,
+  createSession,
+  capture,
+  carryEnv,
+  waitReadyAndCheckVars,
+  planTransfer,
+  consent,
+  quiesceDocker,
+  transfer,
+  launch
+];
 async function cmdPush(args, flags) {
   const ui = Ui.from(flags);
   const dir = args[0] ?? process.cwd();
   const root = projectRoot(dir);
-  if (!fs9.existsSync(path9.join(root, ".git"))) {
+  if (!fs8.existsSync(path9.join(root, ".git"))) {
     ui.error(`not a git repository: ${root}`, "run stepaway push from inside a git project");
     return 1;
   }
@@ -3599,7 +3805,6 @@ async function cmdPush(args, flags) {
   ui.intro(`stepaway push  ${path9.basename(root)}`);
   const cfg = resolveConfig(root, flags);
   const home = os2.homedir();
-  const excludes = excludePrefixes(cfg);
   const wanted = flags.session ? String(flags.session) : null;
   const sid = selectSession(home, root, wanted);
   if (wanted && !sid) {
@@ -3608,37 +3813,13 @@ async function cmdPush(args, flags) {
   }
   if (!sid)
     ui.warn(`no Claude transcript for ${root}; carrying code only`);
+  const capDirName = `stepaway-${Date.now()}`;
   const apiId = sid ?? randomUUID();
-  const remote = remoteProjectPath(cfg, root);
-  const gitDir = remoteGitDir(root);
-  const target = client.server;
-  try {
-    const skew = await client.checkVersion();
-    if (skew.fatal) {
-      ui.error(skew.message ?? "incompatible backend version");
-      return 1;
-    }
-    if (skew.message)
-      ui.warn(skew.message);
-  } catch (e) {
-    ui.error(`backend unreachable: ${e.message}`, "check the URL and token, then: stepaway doctor");
-    return 1;
-  }
-  const boot = ui.spinner(`creating session ${apiId.slice(0, 8)} on ${target}`);
-  let session2;
-  try {
-    session2 = await client.createSession({
-      sessionId: apiId,
-      project: path9.basename(root),
-      options: { remotePathBase: cfg.remotePathBase }
-    });
-  } catch (e) {
-    boot.fail(`could not create the session: ${e.message}`);
-    return 1;
-  }
+  let armed = false;
   let disarmed = false;
-  const abandon = async (why) => {
-    if (disarmed)
+  let why = "aborted";
+  const abandon = async () => {
+    if (!armed || disarmed)
       return;
     disarmed = true;
     try {
@@ -3648,8 +3829,45 @@ async function cmdPush(args, flags) {
       ui.warn(`could not delete session ${apiId}: ${e.message} — run: stepaway destroy --session ${apiId}`);
     }
   };
+  const x = {
+    ui,
+    client,
+    flags,
+    root,
+    cfg,
+    home,
+    excludes: excludePrefixes(cfg),
+    sid,
+    apiId,
+    remote: remoteProjectPath(cfg, root),
+    gitDir: remoteGitDir(root),
+    target: client.server,
+    capDirName,
+    capDir: path9.join(os2.tmpdir(), capDirName),
+    tarPath: path9.join(os2.tmpdir(), `${capDirName}.tar.gz`),
+    fail: (reason) => {
+      why = reason;
+      return 1;
+    },
+    arm: () => {
+      armed = true;
+    },
+    disarm: () => {
+      disarmed = true;
+    },
+    boot: null,
+    session: null,
+    env: null,
+    unmet: [],
+    dplan: null,
+    setupCmd: null,
+    instruction: DEFAULT_INSTRUCTION,
+    manifest: null,
+    report: null
+  };
   const onSigint = () => {
-    abandon("interrupted").then(() => {
+    why = "interrupted";
+    abandon().then(() => {
       process.stderr.write(`
 aborted — nothing was moved; the runner was deleted
 `);
@@ -3657,190 +3875,23 @@ aborted — nothing was moved; the runner was deleted
     });
   };
   process.on("SIGINT", onSigint);
-  const done = (code) => {
+  try {
+    for (const phase of PHASES) {
+      const code = await phase(x);
+      if (code !== null)
+        return code;
+    }
+    return 0;
+  } finally {
     process.off("SIGINT", onSigint);
-    return code;
-  };
-  const stamp = Date.now();
-  const capDirName = `stepaway-${stamp}`;
-  const capDir = path9.join(os2.tmpdir(), capDirName);
-  boot.update(`runner ${session2.podName || apiId.slice(0, 8)} booting — capturing ${path9.basename(root)} meanwhile`);
-  try {
-    await captureLocal(root, capDir, { sessionId: sid, excludes, composeFile: cfg.composeFile });
-  } catch (e) {
-    boot.fail(`capture failed: ${e.message}`);
-    await abandon("capture failed");
-    return done(1);
+    await abandon();
+    fs8.rmSync(x.tarPath, { force: true });
+    fs8.rmSync(x.capDir, { recursive: true, force: true });
   }
-  const cleanup = () => fs9.rmSync(capDir, { recursive: true, force: true });
-  const rawDeclared = readLines(capDir, "meta/declared-env-files.txt");
-  boot.stop(`captured ${path9.basename(root)}; runner still booting`);
-  const {
-    plan: envPlan,
-    asked,
-    declared
-  } = await resolveEnvPlan(rawDeclared, cfg.env, { interactive: !flags.yes, ui, root });
-  const envResult = carryEnvFiles(root, capDir, declared, envPlan);
-  if (asked) {
-    const p2 = rememberEnvChoice(root, { carryFiles: envPlan.carryFiles, excludeVars: envPlan.excludeVars });
-    ui.detail(`remembered env choices in ${p2}`);
-  }
-  const required = readLines(capDir, "meta/required-vars.txt");
-  const wait = ui.spinner("waiting for the runner (image pull + claude install)");
-  try {
-    const ready = await client.waitReady(apiId, {
-      onState: (s) => wait.update(`runner ${s.podName || apiId.slice(0, 8)}: ${s.state}`)
-    });
-    wait.stop(`runner ${ready.podName || apiId.slice(0, 8)} ready`);
-  } catch (e) {
-    wait.fail(e.message);
-    cleanup();
-    await abandon("runner never became ready");
-    return done(1);
-  }
-  let runnerEnv;
-  try {
-    runnerEnv = await client.envNames(apiId, required);
-  } catch (e) {
-    ui.warn(`could not query the runner's env names (${e.message}); assuming none are set`);
-    runnerEnv = new Set;
-  }
-  const unmet = unsatisfiedVars(required, envResult.satisfied, runnerEnv);
-  if (unmet.length) {
-    cleanup();
-    await abandon("unsatisfied variables");
-    ui.error(`refusing to hand off: ${unmet.length} declared variable(s) would be missing on the runner: ${unmet.join(", ")}`, `carry the file that defines them, or set them in .stepaway.json:
-` + `  { "env": { "carryFiles": [...], "overrideVars": { "${unmet[0]}": "value" } } }
-` + `nothing was transferred; the empty runner was deleted.`);
-    return done(1);
-  }
-  const dplan = planDocker(root, cfg.composeFile);
-  const setupCmd = resolveSetup(root, cfg.setup);
-  const instruction = flags.goal ? String(flags.goal) : DEFAULT_INSTRUCTION;
-  let m3 = buildManifest(capDir, {
-    envFiles: envResult.carried,
-    unsatisfied: unmet,
-    skippedEnvFiles: envResult.skipped,
-    docker: dplan ? {
-      compose_file: dplan.composeFile,
-      project: dplan.project,
-      containers: dplan.containers.map((c3) => ({ name: c3.name, image: c3.image, digest: c3.digest })),
-      volumes: dplan.volumes.map((v) => ({ name: v, bytes: 0 })),
-      refused: [],
-      orphans: dplan.orphans
-    } : null
-  });
-  const rw = rewriteSessions(capDir, m3.captured.project_path, remote);
-  if (rw.trimmed)
-    ui.detail(`trimmed ${rw.trimmed} phantom transcript line(s)`);
-  const summary = consentSummary(m3, {
-    remote,
-    gitDir,
-    target,
-    docker: dplan,
-    setup: setupCmd,
-    instruction,
-    color: ui.fancy,
-    verbose: ui.verbose
-  });
-  ui.note(summary, "this is what moves");
-  if (!flags.yes) {
-    if (!isTTY()) {
-      ui.error("refusing to transfer without consent (no TTY)", "re-run with --yes");
-      cleanup();
-      await abandon("no consent");
-      return done(1);
-    }
-    if (!await ui.confirm("Hand this session off to the runner?", false)) {
-      cleanup();
-      await abandon("declined");
-      ui.cancel("aborted — nothing was moved, nothing was stopped, and the empty runner was deleted");
-      return done(1);
-    }
-  }
-  if (dplan) {
-    const spin = ui.spinner(`quiescing ${dplan.containers.length} container(s)`);
-    const dres = await captureDocker(root, capDir, dplan, quiet(ui));
-    spin.stop(`services quiesced and volumes carried`);
-    for (const w of dres.warnings)
-      ui.warn(w);
-    m3 = buildManifest(capDir, {
-      envFiles: envResult.carried,
-      unsatisfied: unmet,
-      skippedEnvFiles: envResult.skipped,
-      docker: dres.manifest
-    });
-  }
-  const xfer = ui.spinner(`transferring to ${target}`);
-  const tarPath = path9.join(os2.tmpdir(), `${capDirName}.tar.gz`);
-  const tr = await bashAsync(`set -e; tar czf ${shq(tarPath)} -C ${shq(os2.tmpdir())} ${shq(capDirName)}`);
-  if (tr.code !== 0) {
-    xfer.fail(`tar failed: ${lastLine(tr.stderr)}`);
-    cleanup();
-    await abandon("tar failed");
-    return done(1);
-  }
-  let report;
-  try {
-    report = await client.uploadCapture(apiId, tarPath, setupCmd);
-  } catch (e) {
-    xfer.fail(`upload failed: ${e.message}`);
-    fs9.rmSync(tarPath, { force: true });
-    cleanup();
-    ui.error("the session still exists on the backend", `retry, or: stepaway destroy --session ${apiId}`);
-    return done(1);
-  }
-  fs9.rmSync(tarPath, { force: true });
-  cleanup();
-  xfer.stop(`transferred to ${target} and restored on the runner`);
-  ui.detail(JSON.stringify(report));
-  if (report && report.restored === false) {
-    ui.error("the runner could not restore the capture", `stepaway destroy --session ${apiId} to clean up`);
-    return done(1);
-  }
-  if (report?.docker && report.docker.attempted && !report.docker.ok) {
-    ui.warn(`services did not all come up on the runner${report.docker.detail ? `: ${report.docker.detail}` : ""}`);
-  }
-  if (report?.setup && report.setup.attempted && !report.setup.ok) {
-    ui.warn(`setup failed on the runner (${report.setup.cmd ?? setupCmd}) — the agent can often fix it`);
-    if (report.setup.tail)
-      ui.detail(report.setup.tail);
-  }
-  const launch = ui.spinner("starting the unattended run");
-  try {
-    await client.run(apiId, { instruction });
-    launch.stop("agent running unattended on the runner");
-  } catch (e) {
-    launch.fail(`could not start the run: ${e.message}`);
-    ui.error("the runner is up with your code on it", `retry, or: stepaway destroy --session ${apiId}`);
-    return done(1);
-  }
-  writeBaton(root, {
-    pushedAt: new Date().toISOString(),
-    server: target,
-    id: apiId,
-    sessionId: capturedSessionId(m3) ?? sid,
-    remotePath: report?.workTree || remote
-  });
-  disarmed = true;
-  ui.outro(`pushed — the cloud is now the source of truth for ${path9.basename(root)}
-` + `  watch:       stepaway peek -f
-` + `  bring back:  stepaway pull
-` + `  abandon:     stepaway destroy`);
-  if (flags.json) {
-    process.stdout.write(JSON.stringify({ ok: true, server: target, sessionId: apiId, remotePath: report?.workTree || remote, gitDir, report, manifest: m3 }, null, 2) + `
-`);
-  }
-  return done(0);
-}
-function lastLine(s) {
-  const lines = s.trim().split(`
-`).filter((l2) => l2.trim());
-  return lines.length ? lines[lines.length - 1] : "(no output)";
 }
 
 // src/commands/pull.ts
-import * as fs10 from "node:fs";
+import * as fs9 from "node:fs";
 import * as os3 from "node:os";
 import * as path10 from "node:path";
 
@@ -3900,25 +3951,25 @@ async function cmdPull(args, flags) {
     bytes = await client.downloadArchive(sessionId, localTar);
   } catch (e) {
     xfer.fail(`archive download failed: ${e.message}`);
-    fs10.rmSync(localTar, { force: true });
+    fs9.rmSync(localTar, { force: true });
     return 1;
   }
   const unpackRoot = path10.join(os3.tmpdir(), capDirName);
-  fs10.rmSync(unpackRoot, { recursive: true, force: true });
-  fs10.mkdirSync(unpackRoot, { recursive: true });
+  fs9.rmSync(unpackRoot, { recursive: true, force: true });
+  fs9.mkdirSync(unpackRoot, { recursive: true });
   const un = await bashAsync(`set -e; tar xzf ${shq(localTar)} -C ${shq(unpackRoot)}`);
   if (un.code !== 0) {
-    xfer.fail(`untar failed: ${lastLine2(un.stderr)}`);
-    fs10.rmSync(localTar, { force: true });
-    fs10.rmSync(unpackRoot, { recursive: true, force: true });
+    xfer.fail(`untar failed: ${lastLine(un.stderr)}`);
+    fs9.rmSync(localTar, { force: true });
+    fs9.rmSync(unpackRoot, { recursive: true, force: true });
     return 1;
   }
   xfer.stop(`transferred home (${Math.max(1, Math.round(bytes / 1024))} KiB)`);
   const capDir = captureDirIn(unpackRoot);
   if (!capDir) {
     ui.error("the archive did not contain a capture directory", "the backend may have sent an empty archive");
-    fs10.rmSync(localTar, { force: true });
-    fs10.rmSync(unpackRoot, { recursive: true, force: true });
+    fs9.rmSync(localTar, { force: true });
+    fs9.rmSync(unpackRoot, { recursive: true, force: true });
     return 1;
   }
   const m3 = buildManifest(capDir);
@@ -3928,13 +3979,13 @@ async function cmdPull(args, flags) {
   const rest = await restoreLocal(capDir, root, m3.captured.branch, localSlug);
   ui.detail(rest.stdout);
   if (rest.code !== 0) {
-    rspin.fail(`restore failed: ${lastLine2(rest.stderr || rest.stdout)}`);
+    rspin.fail(`restore failed: ${lastLine(rest.stderr || rest.stdout)}`);
     return 1;
   }
   rspin.stop(`restored ${m3.captured.branch} into ${root}`);
   const sid = capturedSessionId(m3) ?? baton?.sessionId ?? null;
-  fs10.rmSync(unpackRoot, { recursive: true, force: true });
-  fs10.rmSync(localTar, { force: true });
+  fs9.rmSync(unpackRoot, { recursive: true, force: true });
+  fs9.rmSync(localTar, { force: true });
   clearBaton(root);
   const dspin = ui.spinner(`deleting the runner and its PVC`);
   try {
@@ -3955,19 +4006,14 @@ async function cmdPull(args, flags) {
   return 0;
 }
 function captureDirIn(unpackRoot) {
-  if (fs10.existsSync(path10.join(unpackRoot, "meta")))
+  if (fs9.existsSync(path10.join(unpackRoot, "meta")))
     return unpackRoot;
-  for (const e of fs10.readdirSync(unpackRoot)) {
+  for (const e of fs9.readdirSync(unpackRoot)) {
     const p2 = path10.join(unpackRoot, e);
-    if (fs10.statSync(p2).isDirectory() && fs10.existsSync(path10.join(p2, "meta")))
+    if (fs9.statSync(p2).isDirectory() && fs9.existsSync(path10.join(p2, "meta")))
       return p2;
   }
   return null;
-}
-function lastLine2(s) {
-  const lines = s.trim().split(`
-`).filter((l2) => l2.trim());
-  return lines.length ? lines[lines.length - 1] : "(no output)";
 }
 
 // src/commands/status.ts
@@ -3982,14 +4028,14 @@ function tintState(state, k) {
   return k.warn(k.bold(state));
 }
 async function cmdStatus(args, flags) {
+  const ui = Ui.from(flags);
   const root = projectRoot(args[0] ?? process.cwd());
   const cfg = resolveConfig(root, flags);
   const baton = readBaton(root);
-  const k = colorize(Boolean(process.stdout.isTTY) && !flags.json);
+  const k = colorize(ui.fancy);
   const opened = openClient(root, flags, baton?.server);
   if (!opened.client) {
-    process.stderr.write(`${opened.error}
-`);
+    ui.error(opened.error);
     return 1;
   }
   const client = opened.client;
@@ -4002,23 +4048,22 @@ async function cmdStatus(args, flags) {
       err2 = e.message;
     }
     if (flags.json) {
-      process.stdout.write(JSON.stringify({ project: root, handoff: false, server: client.server, sessions, error: err2 }, null, 2) + `
+      ui.raw(JSON.stringify({ project: root, handoff: false, server: client.server, sessions, error: err2 }, null, 2) + `
 `);
       return err2 ? 1 : 0;
     }
-    process.stdout.write(`project: ${root}
+    ui.raw(`project: ${root}
 no active handoff (push with: stepaway push)
 ` + `backend: ${client.server}
 ` + `default remote working tree would be ${remoteProjectPath(cfg, root)}
 
 `);
     if (err2) {
-      process.stderr.write(`could not list sessions: ${err2}
-`);
+      ui.error(`could not list sessions: ${err2}`);
       return 1;
     }
     if (!sessions.length) {
-      process.stdout.write(`sessions: (none)
+      ui.raw(`sessions: (none)
 `);
       return 0;
     }
@@ -4026,10 +4071,10 @@ no active handoff (push with: stepaway push)
     const idW = w((s2) => s2.id, "SESSION");
     const projW = w((s2) => s2.project ?? "", "PROJECT");
     const stW = w((s2) => s2.state ?? "", "STATE");
-    process.stdout.write(k.dim(`${pad("SESSION", idW)}${pad("PROJECT", projW)}${pad("STATE", stW)}CREATED`) + `
+    ui.raw(k.dim(`${pad("SESSION", idW)}${pad("PROJECT", projW)}${pad("STATE", stW)}CREATED`) + `
 `);
     for (const s2 of sessions) {
-      process.stdout.write(`${pad(s2.id, idW)}${pad(s2.project ?? "", projW)}${pad(s2.state ?? "", stW)}${s2.createdAt ?? ""}
+      ui.raw(`${pad(s2.id, idW)}${pad(s2.project ?? "", projW)}${pad(s2.state ?? "", stW)}${s2.createdAt ?? ""}
 `);
     }
     return 0;
@@ -4042,11 +4087,11 @@ no active handoff (push with: stepaway push)
     err = e.message;
   }
   if (flags.json) {
-    process.stdout.write(JSON.stringify({ project: root, handoff: true, baton, session: s, error: err }, null, 2) + `
+    ui.raw(JSON.stringify({ project: root, handoff: true, baton, session: s, error: err }, null, 2) + `
 `);
     return err ? 1 : 0;
   }
-  process.stdout.write(`project:    ${root} (${path11.basename(root)})
+  ui.raw(`project:    ${root} (${path11.basename(root)})
 ` + `handed off: ${baton.pushedAt}
 ` + `backend:    ${baton.server}
 ` + `session:    ${baton.id}${baton.sessionId && baton.sessionId !== baton.id ? ` (transcript ${baton.sessionId})` : ""}
@@ -4065,20 +4110,22 @@ watch:       stepaway peek -f
 }
 
 // src/commands/doctor.ts
-import * as fs11 from "node:fs";
+import * as fs10 from "node:fs";
 import * as os4 from "node:os";
 import * as path12 from "node:path";
 async function cmdDoctor(args, flags) {
+  const ui = Ui.from(flags);
   const root = projectRoot(args[0] ?? process.cwd());
   const cfg = resolveConfig(root, flags);
   const checks = [];
   const add = (name, ok, detail, blocking = true) => checks.push({ name, ok, detail, blocking });
-  add("git", which("git"), which("git") ? run("git", ["--version"]).stdout.trim() : "not found on PATH");
+  const haveGit = which("git");
+  add("git", haveGit, haveGit ? run("git", ["--version"]).stdout.trim() : "not found on PATH");
   add("tar", which("tar"), which("tar") ? "present" : "not found on PATH");
   add("bash", which("bash"), which("bash") ? "present" : "not found on PATH");
   const major = Number(process.versions.node.split(".")[0]) || 0;
   add("node >= 20", major >= 20, `${process.version} (stepaway ${VERSION})`);
-  const isRepo = fs11.existsSync(path12.join(root, ".git"));
+  const isRepo = fs10.existsSync(path12.join(root, ".git"));
   add("git repo", isRepo, isRepo ? root : `${root} is not a git repository`);
   const home = os4.homedir();
   const slugDir = existingSlugDir(home, root);
@@ -4101,8 +4148,8 @@ async function cmdDoctor(args, flags) {
       const v = await client.version();
       reachable = true;
       add(`backend ${r2.server}`, true, `reachable, api ${v?.api ?? "?"} v${v?.version ?? "?"}`);
-      const skew = versionLine(v?.version ?? "0.0.0");
-      add("version skew", !skew.fatal, skew.detail, skew.fatal);
+      const skew = versionSkew(VERSION, v?.version ?? "0.0.0");
+      add("version skew", !skew.fatal, skew.message ?? `CLI and backend both ${VERSION}`, skew.fatal);
     } catch (e) {
       add(`backend ${r2.server}`, false, e.message);
     }
@@ -4123,39 +4170,31 @@ async function cmdDoctor(args, flags) {
   if (baton)
     add("handoff baton", true, `${baton.id} on ${baton.server} (pushed ${baton.pushedAt})`, false);
   if (flags.json) {
-    process.stdout.write(JSON.stringify({ project: root, server: r2.server, checks }, null, 2) + `
+    ui.raw(JSON.stringify({ project: root, server: r2.server, checks }, null, 2) + `
 `);
   } else {
-    const k = colorize(Boolean(process.stdout.isTTY));
+    const k = colorize(ui.fancy);
     const width = Math.max(...checks.map((c3) => c3.name.length)) + 2;
     for (const c3 of checks) {
       const mark = c3.ok ? k.ok("✓") : c3.blocking ? k.bad("✗") : k.warn("!");
       const name = c3.ok ? pad(c3.name, width) : k.bold(pad(c3.name, width));
-      process.stdout.write(`${mark} ${name}${k.dim(c3.detail)}
+      ui.raw(`${mark} ${name}${k.dim(c3.detail)}
 `);
     }
-    process.stdout.write(`
+    ui.raw(`
 ${k.dim("target:")} ${r2.server ?? "(no backend)"} → ${remoteProjectPath(cfg, root)}
 `);
   }
   return checks.some((c3) => !c3.ok && c3.blocking) ? 1 : 0;
 }
-function versionLine(server) {
-  const cliMajor = VERSION.split(".")[0];
-  const srvMajor = server.split(".")[0];
-  if (cliMajor !== srvMajor)
-    return { fatal: true, detail: `CLI ${VERSION} vs backend ${server} — major mismatch, refusing` };
-  if (VERSION !== server)
-    return { fatal: false, detail: `CLI ${VERSION} vs backend ${server} — compatible` };
-  return { fatal: false, detail: `CLI and backend both ${VERSION}` };
-}
 
 // src/commands/init.ts
-import * as fs12 from "node:fs";
+import * as fs11 from "node:fs";
 async function cmdInit(args, flags) {
+  const ui = Ui.from(flags);
   const root = projectRoot(args[0] ?? process.cwd());
   const p2 = configPath(root);
-  const existed = fs12.existsSync(p2);
+  const existed = fs11.existsSync(p2);
   const cfg = resolveConfig(root, flags);
   const patch = {
     remotePathBase: cfg.remotePathBase,
@@ -4172,10 +4211,10 @@ async function cmdInit(args, flags) {
   const setup = cfg.setup ?? detectSetup(root);
   const global = readClientConfig();
   if (flags.json) {
-    process.stdout.write(JSON.stringify({ path: p2, updated: existed, config: loadConfig(root) }, null, 2) + `
+    ui.raw(JSON.stringify({ path: p2, updated: existed, config: loadConfig(root) }, null, 2) + `
 `);
   } else {
-    process.stdout.write(`${existed ? "updated" : "wrote"} ${p2}
+    ui.raw(`${existed ? "updated" : "wrote"} ${p2}
 ` + `  backend: ${cfg.server ?? global.server ?? "(none yet — run stepaway auth)"}
 ` + `  remote working tree: ${remoteProjectPath(cfg, root)} (one pod per session)
 ` + `  compose file: ${compose ?? "(none)"}
@@ -4187,12 +4226,12 @@ async function cmdInit(args, flags) {
 }
 
 // src/commands/skill.ts
-import * as fs14 from "node:fs";
+import * as fs13 from "node:fs";
 import * as os5 from "node:os";
 import * as path14 from "node:path";
 
 // src/pkg.ts
-import * as fs13 from "node:fs";
+import * as fs12 from "node:fs";
 import * as path13 from "node:path";
 import { fileURLToPath } from "node:url";
 function packageFile(rel) {
@@ -4203,7 +4242,7 @@ function packageFile(rel) {
     path13.join(process.cwd(), rel)
   ];
   for (const c3 of cands)
-    if (fs13.existsSync(c3))
+    if (fs12.existsSync(c3))
       return c3;
   throw new Error(`packaged file not found: ${rel} (looked in ${cands.join(", ")})`);
 }
@@ -4219,9 +4258,9 @@ usage: stepaway skill install
   }
   const src = packageFile(path14.join("skill", "stepaway"));
   const dst = path14.join(os5.homedir(), ".claude", "skills", "stepaway");
-  fs14.mkdirSync(path14.dirname(dst), { recursive: true });
-  fs14.rmSync(dst, { recursive: true, force: true });
-  fs14.cpSync(src, dst, { recursive: true });
+  fs13.mkdirSync(path14.dirname(dst), { recursive: true });
+  fs13.rmSync(dst, { recursive: true, force: true });
+  fs13.cpSync(src, dst, { recursive: true });
   if (flags.json)
     process.stdout.write(JSON.stringify({ installed: dst }, null, 2) + `
 `);
@@ -4260,6 +4299,7 @@ function runSetupToken(usePty) {
   });
 }
 async function cmdAuth(args, flags) {
+  const ui = Ui.from(flags);
   const root = projectRoot(args[0] ?? process.cwd());
   const projectServer = loadConfig(root).server;
   const global = readClientConfig();
@@ -4267,31 +4307,26 @@ async function cmdAuth(args, flags) {
   let server = pre.server;
   let bearer = pre.token;
   if (!server) {
-    if (!isTTY()) {
-      process.stderr.write(`no backend URL. Re-run with:
-  stepaway auth --server https://stepaway.example.com --server-token <token>
-`);
+    if (!ui.interactive) {
+      ui.error("no backend URL. Re-run with:", "  stepaway auth --server https://stepaway.example.com --server-token <token>");
       return 1;
     }
-    const a2 = ask("backend URL (e.g. https://stepaway.example.com): ").trim();
+    const a2 = (await ui.text("backend URL", "https://stepaway.example.com")).trim();
     if (!a2) {
-      process.stderr.write(`no backend URL; nothing stored
-`);
+      ui.error("no backend URL; nothing stored");
       return 1;
     }
     server = normalizeServer(a2);
   }
   if (!bearer) {
-    if (!isTTY()) {
-      process.stderr.write(`no bearer token. Re-run with --server-token <token> (see the chart's NOTES.txt)
-`);
+    if (!ui.interactive) {
+      ui.error("no bearer token. Re-run with --server-token <token> (see the chart's NOTES.txt)");
       return 1;
     }
-    bearer = ask("bearer token (from the Helm chart's NOTES.txt): ").trim() || null;
+    bearer = (await ui.text("bearer token (from the Helm chart's NOTES.txt)")).trim() || null;
   }
   if (!bearer) {
-    process.stderr.write(`no bearer token; nothing stored
-`);
+    ui.error("no bearer token; nothing stored");
     return 1;
   }
   const client = new Client({ server, token: bearer });
@@ -4299,32 +4334,27 @@ async function cmdAuth(args, flags) {
   try {
     const skew = await client.checkVersion();
     if (skew.fatal) {
-      process.stderr.write(`${skew.message}
-`);
+      ui.error(skew.message ?? "incompatible backend version");
       return 1;
     }
     skewNote = skew.message;
   } catch (e) {
-    process.stderr.write(`could not authenticate against ${server}: ${e.message}
-`);
+    ui.error(`could not authenticate against ${server}: ${e.message}`);
     return 1;
   }
   const cfgPath = writeClientConfig({ server, token: bearer });
-  process.stdout.write(`backend ${server} verified; saved to ${cfgPath} (mode 600)
+  ui.raw(`backend ${server} verified; saved to ${cfgPath} (mode 600)
 `);
   if (skewNote)
-    process.stderr.write(`warning: ${skewNote}
-`);
+    ui.warn(skewNote);
   let token = flags.token ? String(flags.token) : null;
   if (!token) {
     if (!which("claude")) {
-      process.stderr.write(`claude is not on PATH. Install Claude Code, or pass an existing token:
-  stepaway auth --token <sk-ant-oat...>
-`);
+      ui.error("claude is not on PATH. Install Claude Code, or pass an existing token:", "  stepaway auth --token <sk-ant-oat...>");
       return 1;
     }
     const usePty = which("script");
-    process.stdout.write(`
+    ui.raw(`
 running: claude setup-token
 (complete the sign-in in your browser)
 
@@ -4332,36 +4362,31 @@ running: claude setup-token
     const r2 = await runSetupToken(usePty);
     token = r2.token;
     if (!token) {
-      if (!isTTY()) {
-        process.stderr.write(`
-could not read a token from 'claude setup-token' (exit ${r2.code}). Re-run with --token <value>.
-`);
+      if (!ui.interactive) {
+        ui.error(`could not read a token from 'claude setup-token' (exit ${r2.code}). Re-run with --token <value>.`);
         return 1;
       }
-      process.stdout.write(`
+      ui.raw(`
 `);
-      token = ask("could not detect the token in that output — paste it here: ").trim() || null;
+      token = (await ui.text("could not detect the token in that output — paste it here")).trim() || null;
     }
   }
   if (!token) {
-    process.stderr.write(`no token; nothing stored on the backend
-`);
+    ui.error("no token; nothing stored on the backend");
     return 1;
   }
   if (!/^sk-ant-/.test(token)) {
-    process.stderr.write(`that does not look like a Claude OAuth token (expected sk-ant-oat…)
-`);
+    ui.error("that does not look like a Claude OAuth token (expected sk-ant-oat…)");
     return 1;
   }
   try {
     await client.putClaudeToken(token);
   } catch (e) {
-    process.stderr.write(`backend refused the Claude token: ${e.message}
-`);
+    ui.error(`backend refused the Claude token: ${e.message}`);
     return 1;
   }
   token = "";
-  process.stdout.write(`
+  ui.raw(`
 stored your Claude token on ${server}
 ` + `runner pods read it as CLAUDE_CODE_OAUTH_TOKEN. Re-run 'stepaway auth' any time to rotate.
 ` + `config: ${clientConfigPath()}
@@ -4550,51 +4575,46 @@ async function cmdPeek(args, flags) {
 
 // src/commands/destroy.ts
 async function cmdDestroy(args, flags) {
+  const ui = Ui.from(flags);
   const root = projectRoot(args[0] ?? process.cwd());
   const baton = readBaton(root);
   const sessionId = flags.session ? String(flags.session) : baton?.id;
   if (!sessionId) {
-    process.stderr.write(`no handoff baton for ${root}; name the session to destroy:
-  stepaway destroy --session <id>
-` + `  ('stepaway status' lists what the backend is running)
-`);
+    ui.error(`no handoff baton for ${root}; name the session to destroy:`, `  stepaway destroy --session <id>
+  ('stepaway status' lists what the backend is running)`);
     return 1;
   }
   const opened = openClient(root, flags, baton?.server);
   if (!opened.client) {
-    process.stderr.write(`${opened.error}
-`);
+    ui.error(opened.error);
     return 1;
   }
   const client = opened.client;
-  process.stdout.write(`destroy session ${sessionId} on ${client.server}
+  ui.raw(`destroy session ${sessionId} on ${client.server}
 ` + `  deletes the pod AND its PVC: any commits still only on the runner are lost.
 ` + (baton ? `  handed off ${baton.pushedAt}, transcript ${baton.sessionId ?? "(none)"}
 ` : "") + `  to keep the work instead, run: stepaway pull
 
 `);
   if (!flags.yes) {
-    if (!isTTY()) {
-      process.stderr.write(`refusing to destroy without confirmation: re-run with --yes (no TTY)
-`);
+    if (!ui.interactive) {
+      ui.error("refusing to destroy without confirmation: re-run with --yes (no TTY)");
       return 1;
     }
-    if (!confirm("Destroy? [y/N] ")) {
-      process.stderr.write(`aborted
-`);
+    if (!await ui.confirm("Destroy?", false)) {
+      ui.error("aborted");
       return 1;
     }
   }
   try {
     await client.deleteSession(sessionId);
   } catch (e) {
-    process.stderr.write(`could not delete session ${sessionId}: ${e.message}
-`);
+    ui.error(`could not delete session ${sessionId}: ${e.message}`);
     return 1;
   }
   if (baton && baton.id === sessionId)
     clearBaton(root);
-  process.stdout.write(`deleted session ${sessionId} (pod + PVC)
+  ui.raw(`deleted session ${sessionId} (pod + PVC)
 `);
   return 0;
 }

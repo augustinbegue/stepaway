@@ -67,7 +67,8 @@ export function toolSummary(input: any): string {
   return "";
 }
 
-function clip(s: string, n: number): string {
+/** One line, whitespace collapsed, ellipsised to at most `n` characters. */
+export function clip(s: string, n: number): string {
   const one = s.replace(/\s+/g, " ").trim();
   return one.length <= n ? one : one.slice(0, n - 1) + "…";
 }

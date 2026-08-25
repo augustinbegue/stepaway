@@ -2,8 +2,8 @@ apiVersion: v2
 name: stepaway
 description: Hand off a live Claude Code session between machines via a k8s-backed runner.
 type: application
-version: 0.1.0
-appVersion: "0.3.0"
+version: 0.1.1
+appVersion: "0.3.1"
 home: https://stepaway.dev
 sources:
   - https://github.com/augustinbegue/stepaway

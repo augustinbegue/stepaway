@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { CONFIG_FILE, DEFAULT_CONFIG, type Config } from "@stepaway/core";
+import { CONFIG_FILE, DEFAULT_CONFIG, type StepawayConfig } from "@stepaway/core";
 import { run } from "./sh.js";
 import { Client } from "./client.js";
 import { NOT_CONFIGURED, readClientConfig, resolveClient } from "./clientconfig.js";
@@ -16,10 +16,8 @@ import { NOT_CONFIGURED, readClientConfig, resolveClient } from "./clientconfig.
  * optional per-project `server` override.
  */
 
-export { CONFIG_FILE, DEFAULT_CONFIG };
-
 /** Project config plus the v0.2 per-project backend override. */
-export type ProjectConfig = Config & { server: string | null };
+export type ProjectConfig = StepawayConfig & { server: string | null };
 
 /**
  * `.git/stepaway-baton.json`: which *backend session* currently holds this

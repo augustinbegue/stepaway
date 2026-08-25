@@ -4,6 +4,7 @@ import { configPath, loadConfig, patchConfig, projectRoot, resolveConfig } from 
 import { detectSetup } from "../setup.js";
 import { findComposeFile } from "../docker.js";
 import { readClientConfig } from "../clientconfig.js";
+import { Ui } from "../ui.js";
 
 /**
  * Write `.stepaway.json`. v0.2: no namespace/pod/context — the CLI addresses a
@@ -12,6 +13,7 @@ import { readClientConfig } from "../clientconfig.js";
  * the token) is the global ~/.config/stepaway/config.json.
  */
 export async function cmdInit(args: string[], flags: Record<string, any>): Promise<number> {
+  const ui = Ui.from(flags);
   const root = projectRoot(args[0] ?? process.cwd());
   const p = configPath(root);
   const existed = fs.existsSync(p);
@@ -32,9 +34,9 @@ export async function cmdInit(args: string[], flags: Record<string, any>): Promi
   const setup = cfg.setup ?? detectSetup(root);
   const global = readClientConfig();
   if (flags.json) {
-    process.stdout.write(JSON.stringify({ path: p, updated: existed, config: loadConfig(root) }, null, 2) + "\n");
+    ui.raw(JSON.stringify({ path: p, updated: existed, config: loadConfig(root) }, null, 2) + "\n");
   } else {
-    process.stdout.write(
+    ui.raw(
       `${existed ? "updated" : "wrote"} ${p}\n` +
         `  backend: ${cfg.server ?? global.server ?? "(none yet — run stepaway auth)"}\n` +
         `  remote working tree: ${remoteProjectPath(cfg, root)} (one pod per session)\n` +

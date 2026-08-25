@@ -7,7 +7,8 @@
 import type { ExecOpts, ExecResult, K8s, PodObject, StorageClassProbe } from "../src/k8s.js";
 
 export type ExecCall = { pod: string; command: string[]; script: string; stdinBytes: number; opts: ExecOpts };
-export type ExecHandler = (call: ExecCall) => Partial<ExecResult> | string | undefined;
+/** Return an Error to make the exec *throw* (timeout / socket drop). */
+export type ExecHandler = (call: ExecCall) => Partial<ExecResult> | string | Error | undefined;
 
 export class MockK8s implements K8s {
   readonly namespace = "stepaway-test";
@@ -100,18 +101,28 @@ export class MockK8s implements K8s {
     for (const h of this.handlers) {
       const r = h(call);
       if (r === undefined) continue;
+      if (r instanceof Error) throw r;
       if (typeof r === "string") return { code: 0, stdout: r, stderr: "" };
       return { code: 0, stdout: "", stderr: "", ...r };
     }
     return { code: 0, stdout: "", stderr: "" };
   }
 
+  /**
+   * Mirrors the real ExecSocket contract: whatever stdout the handler produced
+   * is delivered, and then a non-zero exit ERRORS the stream. A clean close on
+   * a failed exec is exactly the bug the /archive route had.
+   */
   execStream(pod: string, command: string[], opts: ExecOpts = {}): ReadableStream<Uint8Array> {
     const self = this;
     return new ReadableStream<Uint8Array>({
       async start(controller) {
         const r = await self.exec(pod, command, opts);
-        controller.enqueue(new TextEncoder().encode(r.stdout));
+        if (r.stdout) controller.enqueue(new TextEncoder().encode(r.stdout));
+        if (r.code !== 0) {
+          controller.error(new Error(`exec exited ${r.code}${r.stderr ? `: ${r.stderr}` : ""}`));
+          return;
+        }
         // stays open: the follow tests cancel it themselves
         if (!/tail -n \+1 -F/.test(command[2] ?? "")) controller.close();
       },

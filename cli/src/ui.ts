@@ -40,6 +40,14 @@ export class Ui {
     this.fancy = !opts.plain && isTTYOut();
   }
 
+  /**
+   * The single TTY gate. Callers never look at `process.stdin.isTTY`
+   * themselves: they ask the Ui whether a question can be asked at all.
+   */
+  get interactive(): boolean {
+    return Boolean(process.stdin.isTTY && process.stdout.isTTY);
+  }
+
   /** Build the Ui a command should use, from its parsed flags. */
   static from(flags: Record<string, any>): Ui {
     return new Ui({ verbose: Boolean(flags.verbose), plain: Boolean(flags.yes || flags.json) });
@@ -163,7 +171,7 @@ export class Ui {
    * terminal, so callers never block on a pipe.
    */
   async confirm(question: string, fallback: boolean): Promise<boolean> {
-    if (!this.fancy || !process.stdin.isTTY) return fallback;
+    if (!this.fancy || !this.interactive) return fallback;
     const a = await clack.confirm({ message: question, initialValue: false });
     if (clack.isCancel(a)) return false;
     return Boolean(a);
@@ -175,7 +183,7 @@ export class Ui {
     options: { value: string; label: string; hint?: string }[],
     fallback: string[],
   ): Promise<string[]> {
-    if (!this.fancy || !process.stdin.isTTY || !options.length) return fallback;
+    if (!this.fancy || !this.interactive || !options.length) return fallback;
     const a = await clack.multiselect<string>({
       message: question,
       options,
@@ -188,7 +196,7 @@ export class Ui {
 
   /** Free text. Returns "" when non-interactive. */
   async text(question: string, placeholder?: string): Promise<string> {
-    if (!this.fancy || !process.stdin.isTTY) return "";
+    if (!this.fancy || !this.interactive) return "";
     const a = await clack.text({ message: question, placeholder, defaultValue: "" });
     if (clack.isCancel(a)) return "";
     return String(a ?? "");

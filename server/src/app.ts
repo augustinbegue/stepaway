@@ -12,6 +12,7 @@
 
 import { Hono } from "hono";
 import type { Context } from "hono";
+import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { timingSafeEqual } from "node:crypto";
 import { createHash } from "node:crypto";
 import {
@@ -21,27 +22,31 @@ import {
   COMMIT_GUIDANCE,
   DEFAULT_INSTRUCTION,
   DOCKER_RESTORE_SH,
-  EXIT_MARKER,
   RESTORE_RUNNER_SH,
-  RUN_LOG,
   SESSION_LABEL,
+  exitMarkerPath,
   permissionFlags,
   podManifest,
   podName,
   pvcManifest,
+  runLogPath,
   slugFor,
+  stepawayDir,
   type CaptureReport,
+  type ClaudeTokenResponse,
   type CreateSessionRequest,
+  type DeleteSessionResponse,
   type DiagnosticCheck,
   type DiagnosticsResponse,
   type EnvNamesResponse,
   type Manifest,
   type RunRequest,
+  type RunResponse,
   type Session,
   type VersionResponse,
 } from "@stepaway/core";
 import type { K8s, PodObject } from "./k8s.js";
-import { ANN, DEFAULT_REMOTE_BASE, gitDirOf, setState, toSession, workTreeOf } from "./sessions.js";
+import { ANN, DEFAULT_REMOTE_BASE, gitDirOf, remoteBaseOf, setState, toSession, workTreeOf } from "./sessions.js";
 import { bashLine, bashScript, lastLine, shq, tail } from "./sh.js";
 import { VERSION, type ServerConfig } from "./config.js";
 
@@ -63,8 +68,8 @@ export function createApp(deps: AppDeps) {
   const { k8s, config } = deps;
   const app = new Hono();
 
-  const fail = (c: Context, status: number, error: string, detail?: string) =>
-    c.json(detail ? { error, detail } : { error }, status as 400);
+  const fail = (c: Context, status: ContentfulStatusCode, error: string, detail?: string) =>
+    c.json(detail ? { error, detail } : { error }, status);
 
   // ---- auth (everything but healthz) ------------------------------------
   app.use("/v1/*", async (c, next) => {
@@ -131,12 +136,15 @@ export function createApp(deps: AppDeps) {
     return c.json<Session>(await toSession(k8s, pod, { probe: false }), 201);
   });
 
+  // Annotations only: probing here is one exec per pod, serially, on every
+  // `stepaway ls`. GET /sessions/:id is the endpoint that derives, and the CLI
+  // already calls it for the session it cares about.
   app.get("/v1/sessions", async (c) => {
     const pods = await k8s.listPods(SESSION_LABEL);
     const out: Session[] = [];
-    for (const p of pods) out.push(await toSession(k8s, p));
+    for (const p of pods) out.push(await toSession(k8s, p, { probe: false }));
     out.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
-    return c.json(out);
+    return c.json<Session[]>(out);
   });
 
   app.get("/v1/sessions/:id", async (c) => {
@@ -151,13 +159,14 @@ export function createApp(deps: AppDeps) {
     if (!pod) return notFound(c);
     await k8s.deletePod(name);
     await k8s.deletePvc(name);
-    return c.json({ ok: true, podName: name });
+    return c.json<DeleteSessionResponse>({ ok: true, podName: name });
   });
 
   // ---- capture: upload -> restore -> docker -> setup ---------------------
   app.post("/v1/sessions/:id/capture", async (c) => {
     const pod = await requirePod(c);
     if (!pod) return notFound(c);
+    const runner = pod; // alias: the hoisted runCapture() below loses the narrowing
     const name = pod.metadata.name;
     const body = c.req.raw.body;
     if (!body) return fail(c, 400, "empty body", "the request body must be the capture tar.gz stream");
@@ -166,87 +175,100 @@ export function createApp(deps: AppDeps) {
     const dir = `/tmp/stepaway-cap-${Date.now()}`;
     await setState(k8s, name, "restoring", { [ANN.detail]: null });
 
-    const failRestore = async (status: number, error: string, detail: string) => {
+    /** Best-effort removal of the staging dir; never fails the request. */
+    const cleanup = () =>
+      k8s.exec(name, bashLine(`rm -rf ${shq(dir)}`), { timeoutMs: SHORT_TIMEOUT_MS }).catch(() => undefined);
+
+    const failRestore = async (status: ContentfulStatusCode, error: string, detail: string) => {
+      await cleanup();
       await setState(k8s, name, "failed", { [ANN.detail]: detail.slice(0, 400) });
       return fail(c, status, error, detail);
     };
 
-    // 1. straight into tar: no staging on the backend, ever (§3).
+    // Every step below is an exec into the runner, and any of them can throw
+    // (timeout, socket drop). A throw that escaped here used to leave the
+    // session pinned at `restoring` forever — so the whole pipeline is one
+    // try/catch that always lands on a terminal state.
     try {
+      return await runCapture();
+    } catch (e) {
+      return await failRestore(502, "capture failed", (e as Error).message);
+    }
+
+    async function runCapture() {
+      // 1. straight into tar: no staging on the backend, ever (§3).
       const un = await k8s.exec(name, bashLine(`rm -rf ${dir} && mkdir -p ${dir} && tar -xzf - -C ${dir}`), {
         stdin: body as ReadableStream<Uint8Array>,
         timeoutMs: RESTORE_TIMEOUT_MS,
       });
       if (un.code !== 0) return await failRestore(400, "capture upload failed", lastLine(un.stderr || un.stdout));
-    } catch (e) {
-      return await failRestore(502, "capture upload failed", (e as Error).message);
-    }
 
-    // 2. the manifest is the source of truth for branch (and docker), and it
-    //    is inside the payload — read it from the runner, do not ask the CLI.
-    const probe = await k8s.exec(name, bashLine(manifestProbe(dir)), { timeoutMs: SHORT_TIMEOUT_MS });
-    const nl = probe.stdout.indexOf("\n");
-    const capDir = nl < 0 ? "" : probe.stdout.slice(0, nl).trim();
-    let manifest: Manifest | null = null;
-    try {
-      manifest = JSON.parse(probe.stdout.slice(nl + 1)) as Manifest;
-    } catch {
-      manifest = null;
-    }
-    if (!capDir || !manifest) {
-      return await failRestore(400, "invalid capture", "no manifest.json in the uploaded capture");
-    }
-    const branch = manifest.captured.branch || "main";
+      // 2. the manifest is the source of truth for branch (and docker), and it
+      //    is inside the payload — read it from the runner, do not ask the CLI.
+      const probe = await k8s.exec(name, bashLine(manifestProbe(dir)), { timeoutMs: SHORT_TIMEOUT_MS });
+      const nl = probe.stdout.indexOf("\n");
+      const capDir = nl < 0 ? "" : probe.stdout.slice(0, nl).trim();
+      let manifest: Manifest | null = null;
+      try {
+        manifest = JSON.parse(probe.stdout.slice(nl + 1)) as Manifest;
+      } catch {
+        manifest = null;
+      }
+      if (!capDir || !manifest) {
+        return await failRestore(400, "invalid capture", "no manifest.json in the uploaded capture");
+      }
+      const branch = manifest.captured.branch || "main";
 
-    const workTree = workTreeOf(pod);
-    const gitDir = gitDirOf(pod);
-    const slug = slugFor(workTree);
-    await setState(k8s, name, "restoring", { [ANN.workTree]: workTree });
+      const workTree = workTreeOf(runner);
+      const gitDir = gitDirOf(runner);
+      const slug = slugFor(workTree);
+      await setState(k8s, name, "restoring", { [ANN.workTree]: workTree });
 
-    // 3. restore (separate git dir on the PVC)
-    const rest = await k8s.exec(name, bashScript(RESTORE_RUNNER_SH, [capDir, gitDir, workTree, branch, slug]), {
-      timeoutMs: RESTORE_TIMEOUT_MS,
-    });
-    if (rest.code !== 0) {
-      return await failRestore(500, "restore failed", lastLine(rest.stderr || rest.stdout) || "restore script failed");
-    }
-
-    // 4. docker: only when the capture actually carried something
-    const dockerManifest = manifest.captured.docker;
-    const report: CaptureReport = {
-      restored: true,
-      gitDir,
-      workTree,
-      branch,
-      docker: { attempted: false, ok: false },
-      setup: { attempted: false, ok: false },
-    };
-    if (dockerManifest) {
-      report.docker.attempted = true;
-      const dr = await k8s.exec(
-        name,
-        bashScript(DOCKER_RESTORE_SH, [capDir, workTree, dockerManifest.compose_file ?? ""]),
-        { timeoutMs: RESTORE_TIMEOUT_MS },
-      );
-      report.docker.ok = dr.code === 0 && !/^WARN:/m.test(dr.stdout);
-      const d = tail(dr.stdout || dr.stderr, 3);
-      if (d) report.docker.detail = d;
-    }
-
-    // 5. setup, in the restored tree, after the env files landed
-    if (setupCmd) {
-      report.setup = { attempted: true, ok: false, cmd: setupCmd };
-      const su = await k8s.exec(name, bashLine(`cd ${shq(workTree)} && ${setupCmd}`), {
+      // 3. restore (separate git dir on the PVC)
+      const rest = await k8s.exec(name, bashScript(RESTORE_RUNNER_SH, [capDir, gitDir, workTree, branch, slug]), {
         timeoutMs: RESTORE_TIMEOUT_MS,
       });
-      report.setup.ok = su.code === 0;
-      report.setup.tail = tail(su.stdout || su.stderr, 5);
-    }
+      if (rest.code !== 0) {
+        return await failRestore(500, "restore failed", lastLine(rest.stderr || rest.stdout) || "restore script failed");
+      }
 
-    await k8s.exec(name, bashLine(`rm -rf ${dir}`), { timeoutMs: SHORT_TIMEOUT_MS }).catch(() => undefined);
-    // A failed setup is not a failed session: the agent can usually fix it.
-    await setState(k8s, name, "ready", { [ANN.detail]: null });
-    return c.json<CaptureReport>(report);
+      // 4. docker: only when the capture actually carried something
+      const dockerManifest = manifest.captured.docker;
+      const report: CaptureReport = {
+        restored: true,
+        gitDir,
+        workTree,
+        branch,
+        docker: { attempted: false, ok: false },
+        setup: { attempted: false, ok: false },
+      };
+      if (dockerManifest) {
+        report.docker.attempted = true;
+        const dr = await k8s.exec(
+          name,
+          bashScript(DOCKER_RESTORE_SH, [capDir, workTree, dockerManifest.compose_file ?? ""]),
+          { timeoutMs: RESTORE_TIMEOUT_MS },
+        );
+        report.docker.ok = dr.code === 0 && !/^WARN:/m.test(dr.stdout);
+        const d = tail(dr.stdout || dr.stderr, 3);
+        if (d) report.docker.detail = d;
+      }
+
+      // 5. setup, in the restored tree, after the env files landed
+      if (setupCmd) {
+        report.setup = { attempted: true, ok: false, cmd: setupCmd };
+        const su = await k8s.exec(name, bashLine(`cd ${shq(workTree)} && ${setupCmd}`), {
+          timeoutMs: RESTORE_TIMEOUT_MS,
+        });
+        report.setup.ok = su.code === 0;
+        report.setup.tail = tail(su.stdout || su.stderr, 5);
+      }
+
+      await cleanup();
+      // A failed setup is not a failed session: the agent can usually fix it.
+      await setState(k8s, name, "ready", { [ANN.detail]: null });
+      return c.json<CaptureReport>(report);
+    }
   });
 
   // ---- run --------------------------------------------------------------
@@ -265,13 +287,18 @@ export function createApp(deps: AppDeps) {
     const appendSystemPrompt = body.appendSystemPrompt ?? COMMIT_GUIDANCE;
     const workTree = workTreeOf(pod);
     const sid = sessionParam(c);
+    // Everything the wrapper writes lives under the session's own remote base,
+    // not a hard-coded /work — `remotePathBase` is a create-time option.
+    const remoteBase = remoteBaseOf(pod);
+    const swDir = stepawayDir(remoteBase);
+    const runScript = `${swDir}/run.sh`;
 
     // Probe the installed CLI: never pass a flag this version does not know.
     const help = await k8s.exec(name, bashLine("claude --help 2>&1 || true"), { timeoutMs: SHORT_TIMEOUT_MS });
     const perm = permissionFlags(help.stdout + help.stderr);
 
-    const script = launchScript({ workTree, sid, instruction, appendSystemPrompt, flags: perm.flags });
-    const write = await k8s.exec(name, bashLine("mkdir -p /work/.stepaway && cat > /work/.stepaway/run.sh"), {
+    const script = launchScript({ workTree, remoteBase, sid, instruction, appendSystemPrompt, flags: perm.flags });
+    const write = await k8s.exec(name, bashLine(`mkdir -p ${shq(swDir)} && cat > ${shq(runScript)}`), {
       stdin: script,
       timeoutMs: SHORT_TIMEOUT_MS,
     });
@@ -280,11 +307,12 @@ export function createApp(deps: AppDeps) {
     let how = "tmux session 'stepaway'";
     const tmux = await k8s.exec(
       name,
-      bashLine("command -v tmux >/dev/null 2>&1 && tmux new-session -d -s stepaway 'bash -l /work/.stepaway/run.sh'"),
+      // tmux takes the command as argv, which keeps the path in one shq'd word.
+      bashLine(`command -v tmux >/dev/null 2>&1 && tmux new-session -d -s stepaway bash -l ${shq(runScript)}`),
       { timeoutMs: SHORT_TIMEOUT_MS },
     );
     if (tmux.code !== 0) {
-      const nh = await k8s.exec(name, bashLine("nohup bash -l /work/.stepaway/run.sh >/dev/null 2>&1 &"), {
+      const nh = await k8s.exec(name, bashLine(`nohup bash -l ${shq(runScript)} >/dev/null 2>&1 &`), {
         timeoutMs: SHORT_TIMEOUT_MS,
       });
       if (nh.code !== 0) {
@@ -293,13 +321,13 @@ export function createApp(deps: AppDeps) {
       how = "nohup (no tmux on the runner)";
     }
     await setState(k8s, name, "running", { [ANN.exitCode]: null, [ANN.detail]: null });
-    return c.json({
+    return c.json<RunResponse>({
       ok: true,
       how,
-      log: RUN_LOG,
+      log: runLogPath(remoteBase),
       permissionFlags: perm.flags,
       warn: perm.warn ?? undefined,
-      state: "running" as const,
+      state: "running",
     });
   });
 
@@ -357,7 +385,7 @@ export function createApp(deps: AppDeps) {
       .map((s) => s.trim())
       .filter((s) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(s));
     if (!names.length) return c.json<EnvNamesResponse>({ satisfied: [] });
-    const script = `for v in ${names.map((n) => `'${n}'`).join(" ")}; do printenv "$v" >/dev/null 2>&1 && echo "$v"; done; true`;
+    const script = `for v in ${names.map(shq).join(" ")}; do printenv "$v" >/dev/null 2>&1 && echo "$v"; done; true`;
     const r = await k8s.exec(pod.metadata.name, bashLine(script), { timeoutMs: SHORT_TIMEOUT_MS });
     const got = new Set(r.stdout.split("\n").map((s) => s.trim()).filter(Boolean));
     return c.json<EnvNamesResponse>({ satisfied: names.filter((n) => got.has(n)) });
@@ -378,7 +406,7 @@ export function createApp(deps: AppDeps) {
     } catch (e) {
       return fail(c, 502, "could not store the token", (e as Error).message);
     }
-    return c.json({ ok: true, secret: AUTH_SECRET });
+    return c.json<ClaudeTokenResponse>({ ok: true, secret: AUTH_SECRET });
   });
 
   // ---- diagnostics ------------------------------------------------------
@@ -515,11 +543,16 @@ function manifestProbe(dir: string): string {
  */
 export function launchScript(o: {
   workTree: string;
+  /** the session's remote path base; the .stepaway dir hangs off it. */
+  remoteBase?: string;
   sid: string | null;
   instruction: string;
   appendSystemPrompt: string;
   flags: string[];
 }): string {
+  const swDir = stepawayDir(o.remoteBase ?? DEFAULT_REMOTE_BASE);
+  const runLog = runLogPath(o.remoteBase ?? DEFAULT_REMOTE_BASE);
+  const exitMarker = exitMarkerPath(o.remoteBase ?? DEFAULT_REMOTE_BASE);
   const parts = [
     "claude",
     "-p",
@@ -532,13 +565,13 @@ export function launchScript(o: {
   return [
     "#!/bin/bash",
     "# written by the stepaway backend; the exit marker drives the run state.",
-    "mkdir -p /work/.stepaway",
-    `rm -f ${EXIT_MARKER}`,
+    `mkdir -p ${shq(swDir)}`,
+    `rm -f ${shq(exitMarker)}`,
     `cd ${shq(o.workTree)} || exit 1`,
     "set -o pipefail",
-    `${parts.join(" ")} 2>&1 | tee -a ${RUN_LOG}`,
+    `${parts.join(" ")} 2>&1 | tee -a ${shq(runLog)}`,
     "ec=${PIPESTATUS[0]}",
-    `printf '%s\\n' "\${ec}" > ${EXIT_MARKER}`,
+    `printf '%s\\n' "\${ec}" > ${shq(exitMarker)}`,
     "exit ${ec}",
     "",
   ].join("\n");

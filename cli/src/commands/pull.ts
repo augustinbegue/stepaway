@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { bashAsync, run, shq } from "../sh.js";
+import { bashAsync, lastLine, run, shq } from "../sh.js";
 import { capturedSessionId, slugFor } from "@stepaway/core";
 import { clearBaton, openClient, projectRoot, readBaton } from "../config.js";
 import { buildManifest, existingSlugDir, rewriteSessions } from "../capture.js";
@@ -149,10 +149,4 @@ function captureDirIn(unpackRoot: string): string | null {
     if (fs.statSync(p).isDirectory() && fs.existsSync(path.join(p, "meta"))) return p;
   }
   return null;
-}
-
-/** Errors from remote scripts can be pages long; the last line is the news. */
-function lastLine(s: string): string {
-  const lines = s.trim().split("\n").filter((l) => l.trim());
-  return lines.length ? lines[lines.length - 1] : "(no output)";
 }

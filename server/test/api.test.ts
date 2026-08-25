@@ -154,6 +154,18 @@ describe("sessions", () => {
     expect(missing.status).toBe(404);
   });
 
+  test("list answers from annotations only — no exec per pod", async () => {
+    const k8s = new MockK8s({ pods: [ready({ ...BASE_ANN, [ANN.state]: "running" })] });
+    const list = (await (await app(k8s).fetch(req(ROUTES.sessions))).json()) as Session[];
+    expect(list[0].state).toBe("running");
+    expect(k8s.execs).toHaveLength(0);
+
+    // the detail route is the one that derives
+    k8s.on((c) => (c.script.includes("exit-code") ? "0\n" : undefined));
+    const one = (await (await app(k8s).fetch(req(ROUTES.session(SID)))).json()) as Session;
+    expect(one.state).toBe("done");
+  });
+
   test("delete removes pod and PVC", async () => {
     const k8s = new MockK8s({ pods: [ready({ ...BASE_ANN, [ANN.state]: "ready" })] });
     k8s.pvcs.add(POD);
@@ -341,6 +353,29 @@ describe("capture", () => {
     expect(k8s.pods.get(POD)!.metadata.annotations?.[ANN.state]).toBe("failed");
   });
 
+  test("a step that throws leaves the session failed, not stranded in restoring", async () => {
+    // P0: only step 1 used to be wrapped, so a timeout in restore/docker/setup
+    // escaped to the generic 500 handler and the pod stayed `restoring` forever.
+    const k8s = captureMock();
+    k8s.on((c) => (c.script.includes("gitdir: %s") ? new Error("exec timed out after 1200000ms") : undefined));
+    const res = await app(k8s).fetch(req(ROUTES.capture(SID), { method: "POST", body: "tarbytes" }));
+    expect(res.status).toBe(502);
+    const body = await res.json();
+    expect(body.detail).toContain("timed out");
+    const ann = k8s.pods.get(POD)!.metadata.annotations!;
+    expect(ann[ANN.state]).toBe("failed");
+    expect(ann[ANN.detail]).toContain("timed out");
+    // and the staging dir is not left behind on the runner
+    expect(k8s.execs.some((e) => e.script.startsWith("rm -rf '/tmp/stepaway-cap-"))).toBe(true);
+  });
+
+  test("a failure detail is bounded and carries no environment values", async () => {
+    const k8s = captureMock();
+    k8s.on((c) => (c.script.includes("gitdir: %s") ? new Error("x".repeat(900)) : undefined));
+    await app(k8s).fetch(req(ROUTES.capture(SID), { method: "POST", body: "tarbytes" }));
+    expect(k8s.pods.get(POD)!.metadata.annotations![ANN.detail]!.length).toBe(400);
+  });
+
   test("404 for an unknown session, without touching the cluster", async () => {
     const k8s = new MockK8s();
     expect((await app(k8s).fetch(req(ROUTES.capture(SID), { method: "POST", body: "x" }))).status).toBe(404);
@@ -360,10 +395,11 @@ describe("run", () => {
     expect(body.permissionFlags).toEqual(["--permission-mode", "auto"]);
     expect(body.how).toContain("tmux");
 
-    const staged = k8s.execs.find((e) => e.script.includes("cat > /work/.stepaway/run.sh"))!;
+    const staged = k8s.execs.find((e) => e.script.includes("cat > '/work/.stepaway/run.sh'"))!;
     expect(staged.opts.stdin).toContain("--resume '0ea9f8b7-1111-2222-3333-444455556666'");
     expect(staged.opts.stdin).toContain("'finish the refactor'");
     expect(staged.opts.stdin).toContain("/work/.stepaway/exit-code");
+    expect(body.log).toBe("/work/.stepaway/run.log");
     expect(k8s.pods.get(POD)!.metadata.annotations?.[ANN.state]).toBe("running");
   });
 
@@ -382,6 +418,23 @@ describe("run", () => {
     expect(k8s.pods.get(POD)!.metadata.annotations?.[ANN.state]).toBe("running");
   });
 
+  test("a non-default remotePathBase moves the log, marker and wrapper with it", async () => {
+    const k8s = new MockK8s({
+      pods: [ready({ ...BASE_ANN, [ANN.remoteBase]: "/srv/work", [ANN.state]: "ready" })],
+    });
+    const body = await (await app(k8s).fetch(req(ROUTES.run(SID), { method: "POST", body: "{}" }))).json();
+    expect(body.log).toBe("/srv/work/.stepaway/run.log");
+    const staged = k8s.execs.find((e) => e.script.includes("run.sh"))!;
+    expect(staged.script).toContain("'/srv/work/.stepaway/run.sh'");
+    expect(staged.opts.stdin).toContain("'/srv/work/.stepaway/exit-code'");
+    expect(staged.opts.stdin).not.toContain("'/work/.stepaway");
+
+    // and the state derivation reads the marker from the same place
+    k8s.on((c) => (c.script.includes("/srv/work/.stepaway/exit-code") ? "0\n" : undefined));
+    const s = (await (await app(k8s).fetch(req(ROUTES.session(SID)))).json()) as Session;
+    expect(s.state).toBe("done");
+  });
+
   test("the launch wrapper records the exit code of claude, not of tee", () => {
     const script = launchScript({
       workTree: "/work/p",
@@ -392,8 +445,8 @@ describe("run", () => {
     });
     expect(script).toContain("set -o pipefail");
     expect(script).toContain("ec=${PIPESTATUS[0]}");
-    expect(script).toContain("> /work/.stepaway/exit-code");
-    expect(script).toContain("tee -a /work/.stepaway/run.log");
+    expect(script).toContain("> '/work/.stepaway/exit-code'");
+    expect(script).toContain("tee -a '/work/.stepaway/run.log'");
   });
 });
 
@@ -441,6 +494,18 @@ describe("archive", () => {
     expect(cap.command[4]).toBe("/work/car-mod-viz");
     expect(cap.command[6]).toBe(SID);
     expect(k8s.execs[1].script).toContain("rm -rf /tmp/stepaway-arch-");
+  });
+
+  test("a tar that dies mid-stream aborts the response, not a clean truncated 200", async () => {
+    // The archive body IS the user's work: a 200 whose gzip stops halfway is
+    // worse than an error, because nothing downstream notices.
+    const k8s = new MockK8s({ pods: [ready({ ...BASE_ANN, [ANN.workTree]: "/work/car-mod-viz" })] });
+    k8s.on((c) =>
+      c.script.startsWith("tar czf - -C /tmp") ? { code: 2, stdout: "HALF-A-TAR", stderr: "tar: write error" } : undefined,
+    );
+    const res = await app(k8s).fetch(req(ROUTES.archive(SID)));
+    expect(res.status).toBe(200); // headers were already on the wire
+    await expect(res.text()).rejects.toThrow();
   });
 
   test("a failed capture is a 500, not a truncated tar", async () => {

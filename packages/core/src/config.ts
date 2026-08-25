@@ -36,9 +36,6 @@ export type StepawayConfig = {
   env: EnvConfig | null;
 };
 
-/** Legacy alias — the CLI has called this `Config` since v0.1. */
-export type Config = StepawayConfig;
-
 export const CONFIG_FILE = ".stepaway.json";
 
 export const DEFAULT_CONFIG: StepawayConfig = {
@@ -68,12 +65,3 @@ export function remoteProjectPath(cfg: StepawayConfig, localRoot: string): strin
 export function remoteGitDir(localRoot: string): string {
   return `/repo/${path.basename(localRoot)}.git`;
 }
-
-/** `.git/stepaway-baton.json`: which backend/session currently holds this project. */
-export type Baton = {
-  pushedAt: string;
-  server: string;
-  id: string;
-  sessionId: string | null;
-  remotePath: string;
-};

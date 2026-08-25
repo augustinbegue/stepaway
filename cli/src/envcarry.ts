@@ -8,7 +8,6 @@ import {
   type CarriedEnvFile,
   type EnvConfig,
 } from "@stepaway/core";
-import { isTTY } from "./sh.js";
 import type { Ui } from "./ui.js";
 
 /**
@@ -150,7 +149,7 @@ export async function resolveEnvPlan(
     };
   }
   const ui = opts.ui;
-  if (opts.interactive && ui?.fancy && isTTY() && list.length) {
+  if (opts.interactive && ui?.fancy && ui.interactive && list.length) {
     const picked = await pickEnvFiles(ui, root, list);
     return { plan: { ...picked, overrideVars: {} }, asked: true, declared: list };
   }

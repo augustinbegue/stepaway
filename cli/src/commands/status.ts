@@ -1,7 +1,7 @@
 import * as path from "node:path";
 import { remoteGitDir, remoteProjectPath, type Session } from "@stepaway/core";
 import { openClient, projectRoot, readBaton, resolveConfig } from "../config.js";
-import { colorize, pad } from "../ui.js";
+import { Ui, colorize, pad } from "../ui.js";
 
 /** The state field is the headline: everything else is context for it. */
 function tintState(state: string, k: ReturnType<typeof colorize>): string {
@@ -12,14 +12,15 @@ function tintState(state: string, k: ReturnType<typeof colorize>): string {
 }
 
 export async function cmdStatus(args: string[], flags: Record<string, any>): Promise<number> {
+  const ui = Ui.from(flags);
   const root = projectRoot(args[0] ?? process.cwd());
   const cfg = resolveConfig(root, flags);
   const baton = readBaton(root);
-  const k = colorize(Boolean(process.stdout.isTTY) && !flags.json);
+  const k = colorize(ui.fancy);
 
   const opened = openClient(root, flags, baton?.server);
   if (!opened.client) {
-    process.stderr.write(`${opened.error}\n`);
+    ui.error(opened.error);
     return 1;
   }
   const client = opened.client;
@@ -34,20 +35,20 @@ export async function cmdStatus(args: string[], flags: Record<string, any>): Pro
       err = (e as Error).message;
     }
     if (flags.json) {
-      process.stdout.write(JSON.stringify({ project: root, handoff: false, server: client.server, sessions, error: err }, null, 2) + "\n");
+      ui.raw(JSON.stringify({ project: root, handoff: false, server: client.server, sessions, error: err }, null, 2) + "\n");
       return err ? 1 : 0;
     }
-    process.stdout.write(
+    ui.raw(
       `project: ${root}\nno active handoff (push with: stepaway push)\n` +
         `backend: ${client.server}\n` +
         `default remote working tree would be ${remoteProjectPath(cfg, root)}\n\n`,
     );
     if (err) {
-      process.stderr.write(`could not list sessions: ${err}\n`);
+      ui.error(`could not list sessions: ${err}`);
       return 1;
     }
     if (!sessions.length) {
-      process.stdout.write("sessions: (none)\n");
+      ui.raw("sessions: (none)\n");
       return 0;
     }
     const w = (f: (s: Session) => string, head: string) =>
@@ -55,11 +56,11 @@ export async function cmdStatus(args: string[], flags: Record<string, any>): Pro
     const idW = w((s) => s.id, "SESSION");
     const projW = w((s) => s.project ?? "", "PROJECT");
     const stW = w((s) => s.state ?? "", "STATE");
-    process.stdout.write(
+    ui.raw(
       k.dim(`${pad("SESSION", idW)}${pad("PROJECT", projW)}${pad("STATE", stW)}CREATED`) + "\n",
     );
     for (const s of sessions) {
-      process.stdout.write(
+      ui.raw(
         `${pad(s.id, idW)}${pad(s.project ?? "", projW)}${pad(s.state ?? "", stW)}${s.createdAt ?? ""}\n`,
       );
     }
@@ -75,11 +76,11 @@ export async function cmdStatus(args: string[], flags: Record<string, any>): Pro
   }
 
   if (flags.json) {
-    process.stdout.write(JSON.stringify({ project: root, handoff: true, baton, session: s, error: err }, null, 2) + "\n");
+    ui.raw(JSON.stringify({ project: root, handoff: true, baton, session: s, error: err }, null, 2) + "\n");
     return err ? 1 : 0;
   }
 
-  process.stdout.write(
+  ui.raw(
     `project:    ${root} (${path.basename(root)})\n` +
       `handed off: ${baton.pushedAt}\n` +
       `backend:    ${baton.server}\n` +

@@ -241,7 +241,11 @@ export class Client {
       duplex: "half",
     });
     const text = await res.text();
-    if (!text.trim()) return emptyReport();
+    // the contract says /capture always answers with a CaptureReport; an empty
+    // body is a broken backend, never a silent success.
+    if (!text.trim()) {
+      throw new ApiError("backend returned an empty body from /capture", res.status, "expected a CaptureReport");
+    }
     try {
       return JSON.parse(text) as CaptureReport;
     } catch {
@@ -304,17 +308,6 @@ export class Client {
     }
     if (buf.trim()) flushEvent(buf);
   }
-}
-
-function emptyReport(): CaptureReport {
-  return {
-    restored: true,
-    gitDir: "",
-    workTree: "",
-    branch: "",
-    docker: { attempted: false, ok: true },
-    setup: { attempted: false, ok: true },
-  };
 }
 
 export function sleep(ms: number): Promise<void> {

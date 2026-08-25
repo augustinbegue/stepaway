@@ -90,11 +90,11 @@ NetworkPolicy. Turn these on per-cluster as needed:
 | `ingress.tls.secretName` | `""` | Pre-existing TLS Secret name; empty disables TLS. |
 | `runner.image` | `ghcr.io/augustinbegue/stepaway-runner:latest` | Default runner pod image, passed to the backend as `RUNNER_IMAGE`. |
 | `runner.resources.cpuRequest` | `250m` | `RUNNER_CPU_REQUEST`. |
-| `runner.resources.memRequest` | `512Mi` | `RUNNER_MEM_REQUEST`. |
-| `runner.resources.memLimit` | `2Gi` | `RUNNER_MEM_LIMIT`. |
+| `runner.resources.memRequest` | `512Mi` | `RUNNER_MEMORY_REQUEST`. |
+| `runner.resources.memLimit` | `2Gi` | `RUNNER_MEMORY_LIMIT`. |
 | `runner.storageClass` | `""` | `RUNNER_STORAGE_CLASS` (empty = cluster default). |
-| `runner.pvc.size` | `5Gi` | `RUNNER_PVC_SIZE`. |
-| `runner.dind.enabled` | `true` | `RUNNER_DIND_ENABLED`. |
+| `runner.pvc.size` | `5Gi` | `RUNNER_STORAGE_SIZE`. |
+| `runner.dind.enabled` | `true` | `RUNNER_DIND_ENABLED`. `false` drops the privileged dind sidecar from every runner pod (no docker in sessions). |
 | `quotas.enabled` | `false` | Enable the ResourceQuota. |
 | `quotas.maxPods` | `"10"` | Pod count hard limit. |
 | `quotas.maxPVCs` | `"10"` | PVC count hard limit. |

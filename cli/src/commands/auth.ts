@@ -1,7 +1,8 @@
 import { spawn } from "node:child_process";
-import { ask, isTTY, which } from "../sh.js";
+import { which } from "../sh.js";
 import { projectRoot, loadConfig } from "../config.js";
 import { Client } from "../client.js";
+import { Ui } from "../ui.js";
 import {
   clientConfigPath,
   normalizeServer,
@@ -65,6 +66,7 @@ function runSetupToken(usePty: boolean): Promise<{ token: string | null; code: n
  *      backend, which owns the k8s Secret.
  */
 export async function cmdAuth(args: string[], flags: Record<string, any>): Promise<number> {
+  const ui = Ui.from(flags);
   const root = projectRoot(args[0] ?? process.cwd());
   const projectServer = loadConfig(root).server;
   const global = readClientConfig();
@@ -74,28 +76,30 @@ export async function cmdAuth(args: string[], flags: Record<string, any>): Promi
   let bearer = pre.token;
 
   if (!server) {
-    if (!isTTY()) {
-      process.stderr.write(
-        "no backend URL. Re-run with:\n  stepaway auth --server https://stepaway.example.com --server-token <token>\n",
+    // one TTY gate: the Ui decides whether anything can be asked
+    if (!ui.interactive) {
+      ui.error(
+        "no backend URL. Re-run with:",
+        "  stepaway auth --server https://stepaway.example.com --server-token <token>",
       );
       return 1;
     }
-    const a = ask("backend URL (e.g. https://stepaway.example.com): ").trim();
+    const a = (await ui.text("backend URL", "https://stepaway.example.com")).trim();
     if (!a) {
-      process.stderr.write("no backend URL; nothing stored\n");
+      ui.error("no backend URL; nothing stored");
       return 1;
     }
     server = normalizeServer(a);
   }
   if (!bearer) {
-    if (!isTTY()) {
-      process.stderr.write("no bearer token. Re-run with --server-token <token> (see the chart's NOTES.txt)\n");
+    if (!ui.interactive) {
+      ui.error("no bearer token. Re-run with --server-token <token> (see the chart's NOTES.txt)");
       return 1;
     }
-    bearer = ask("bearer token (from the Helm chart's NOTES.txt): ").trim() || null;
+    bearer = (await ui.text("bearer token (from the Helm chart's NOTES.txt)")).trim() || null;
   }
   if (!bearer) {
-    process.stderr.write("no bearer token; nothing stored\n");
+    ui.error("no bearer token; nothing stored");
     return 1;
   }
 
@@ -105,64 +109,63 @@ export async function cmdAuth(args: string[], flags: Record<string, any>): Promi
   try {
     const skew = await client.checkVersion();
     if (skew.fatal) {
-      process.stderr.write(`${skew.message}\n`);
+      ui.error(skew.message ?? "incompatible backend version");
       return 1;
     }
     skewNote = skew.message;
   } catch (e) {
-    process.stderr.write(`could not authenticate against ${server}: ${(e as Error).message}\n`);
+    ui.error(`could not authenticate against ${server}: ${(e as Error).message}`);
     return 1;
   }
 
   const cfgPath = writeClientConfig({ server, token: bearer });
-  process.stdout.write(`backend ${server} verified; saved to ${cfgPath} (mode 600)\n`);
-  if (skewNote) process.stderr.write(`warning: ${skewNote}\n`);
+  ui.raw(`backend ${server} verified; saved to ${cfgPath} (mode 600)\n`);
+  if (skewNote) ui.warn(skewNote);
 
   // 2. the Claude OAuth token
   let token: string | null = flags.token ? String(flags.token) : null;
 
   if (!token) {
     if (!which("claude")) {
-      process.stderr.write(
-        "claude is not on PATH. Install Claude Code, or pass an existing token:\n  stepaway auth --token <sk-ant-oat...>\n",
+      ui.error(
+        "claude is not on PATH. Install Claude Code, or pass an existing token:",
+        "  stepaway auth --token <sk-ant-oat...>",
       );
       return 1;
     }
     // a pty keeps the TUI from repainting every frame into our pipe
     const usePty = which("script");
-    process.stdout.write(`\nrunning: claude setup-token\n(complete the sign-in in your browser)\n\n`);
+    ui.raw(`\nrunning: claude setup-token\n(complete the sign-in in your browser)\n\n`);
     const r = await runSetupToken(usePty);
     token = r.token;
     if (!token) {
-      if (!isTTY()) {
-        process.stderr.write(
-          `\ncould not read a token from 'claude setup-token' (exit ${r.code}). Re-run with --token <value>.\n`,
-        );
+      if (!ui.interactive) {
+        ui.error(`could not read a token from 'claude setup-token' (exit ${r.code}). Re-run with --token <value>.`);
         return 1;
       }
-      process.stdout.write("\n");
-      token = ask("could not detect the token in that output — paste it here: ").trim() || null;
+      ui.raw("\n");
+      token = (await ui.text("could not detect the token in that output — paste it here")).trim() || null;
     }
   }
 
   if (!token) {
-    process.stderr.write("no token; nothing stored on the backend\n");
+    ui.error("no token; nothing stored on the backend");
     return 1;
   }
   if (!/^sk-ant-/.test(token)) {
-    process.stderr.write("that does not look like a Claude OAuth token (expected sk-ant-oat…)\n");
+    ui.error("that does not look like a Claude OAuth token (expected sk-ant-oat…)");
     return 1;
   }
 
   try {
     await client.putClaudeToken(token);
   } catch (e) {
-    process.stderr.write(`backend refused the Claude token: ${(e as Error).message}\n`);
+    ui.error(`backend refused the Claude token: ${(e as Error).message}`);
     return 1;
   }
   token = "";
 
-  process.stdout.write(
+  ui.raw(
     `\nstored your Claude token on ${server}\n` +
       `runner pods read it as CLAUDE_CODE_OAUTH_TOKEN. Re-run 'stepaway auth' any time to rotate.\n` +
       `config: ${clientConfigPath()}\n`,

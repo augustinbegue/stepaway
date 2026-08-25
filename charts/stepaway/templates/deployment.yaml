@@ -52,13 +52,13 @@ spec:
               value: {{ .Values.runner.image | quote }}
             - name: RUNNER_CPU_REQUEST
               value: {{ .Values.runner.resources.cpuRequest | quote }}
-            - name: RUNNER_MEM_REQUEST
+            - name: RUNNER_MEMORY_REQUEST
               value: {{ .Values.runner.resources.memRequest | quote }}
-            - name: RUNNER_MEM_LIMIT
+            - name: RUNNER_MEMORY_LIMIT
               value: {{ .Values.runner.resources.memLimit | quote }}
             - name: RUNNER_STORAGE_CLASS
               value: {{ .Values.runner.storageClass | quote }}
-            - name: RUNNER_PVC_SIZE
+            - name: RUNNER_STORAGE_SIZE
               value: {{ .Values.runner.pvc.size | quote }}
             - name: RUNNER_DIND_ENABLED
               value: {{ .Values.runner.dind.enabled | quote }}

@@ -12,9 +12,35 @@ export const DEFAULT_INSTRUCTION =
 export const COMMIT_GUIDANCE =
   "Commit locally after each coherent unit of work — the repository survives crashes, the working tree does not.";
 
-/** Where the launch wrapper writes its log and its process-exit marker. */
-export const RUN_LOG = "/work/.stepaway/run.log";
-export const EXIT_MARKER = "/work/.stepaway/exit-code";
+/** Remote base used when a session carries no `remotePathBase` override. */
+export const DEFAULT_REMOTE_BASE = "/work";
+
+/**
+ * The backend's scratch directory inside the runner, under whatever remote base
+ * the session was created with (`remotePathBase`, default /work). Everything
+ * below is derived from it so a non-default base is honoured end to end.
+ */
+export function stepawayDir(remoteBase: string = DEFAULT_REMOTE_BASE): string {
+  const base = (remoteBase || DEFAULT_REMOTE_BASE).replace(/\/+$/, "") || "";
+  return `${base}/.stepaway`;
+}
+
+/** Where the launch wrapper tees its log, for a given remote base. */
+export function runLogPath(remoteBase: string = DEFAULT_REMOTE_BASE): string {
+  return `${stepawayDir(remoteBase)}/run.log`;
+}
+
+/** The process-exit marker that makes `running -> done|failed` derivable. */
+export function exitMarkerPath(remoteBase: string = DEFAULT_REMOTE_BASE): string {
+  return `${stepawayDir(remoteBase)}/exit-code`;
+}
+
+/**
+ * Default-base conveniences, kept for callers that have no session in hand.
+ * Prefer the functions above wherever a remote base is known.
+ */
+export const RUN_LOG = runLogPath();
+export const EXIT_MARKER = exitMarkerPath();
 
 /**
  * Strongest auto-approval mode the installed CLI supports, probed from its own

@@ -88,6 +88,40 @@ export interface ApiError {
   detail?: string;
 }
 
+// ---------------------------------------------------------------------------
+// v1.1 additive
+//
+// Response shapes that v1 implemented but never declared. Additive only: no
+// field here is new on the wire, so a v1 client keeps working unchanged.
+// ---------------------------------------------------------------------------
+
+/** Response of POST /sessions/:id/run. */
+export interface RunResponse {
+  ok: true;
+  /** How the run was started, e.g. "tmux session 'stepaway'". */
+  how: string;
+  /** Absolute path of the run log inside the runner. */
+  log: string;
+  /** Permission flags the server picked for the installed CLI. */
+  permissionFlags: string[];
+  /** Set when the server had to fall back to a weaker permission mode. */
+  warn?: string;
+  state: SessionState;
+}
+
+/** Response of DELETE /sessions/:id. */
+export interface DeleteSessionResponse {
+  ok: true;
+  podName: string;
+}
+
+/** Response of PUT /claude-token. */
+export interface ClaudeTokenResponse {
+  ok: true;
+  /** Name of the k8s Secret the token landed in. */
+  secret: string;
+}
+
 /** Route table (path templates, `:id` = session id). */
 export const ROUTES = {
   sessions: `${API_PREFIX}/sessions`,

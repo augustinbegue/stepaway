@@ -60,7 +60,12 @@ export interface K8s {
   /** SelfSubjectAccessReview; false when the review itself is refused. */
   canI(verb: string, resource: string, subresource?: string): Promise<boolean>;
   exec(pod: string, command: string[], opts?: ExecOpts): Promise<ExecResult>;
-  /** stdout of the remote process as a stream; cancelling closes the socket. */
+  /**
+   * stdout of the remote process as a stream; cancelling closes the socket.
+   * A non-zero exit (or a missing channel-3 status) errors the stream — the
+   * consumer must never mistake a truncated payload for a complete one.
+   * `opts.timeoutMs` applies here exactly as it does to exec().
+   */
   execStream(pod: string, command: string[], opts?: ExecOpts): ReadableStream<Uint8Array>;
 }
 
@@ -283,7 +288,7 @@ export class RestK8s implements K8s {
           controller.error(e);
         }
       },
-      cancel: () => sock?.close(),
+      cancel: () => sock?.cancel(),
     });
   }
 }
@@ -298,21 +303,39 @@ const CH_ERROR = 3;
 /** v5 only: {255, streamId} closes one stream (we use it for stdin EOF). */
 const CH_CLOSE = 255;
 
+/** Hot path: one encoder/decoder for the process, not one per frame. */
+const ENC = new TextEncoder();
+const DEC = new TextDecoder();
+
+/** Where a dispatched frame's bytes go. stderr/status default to accumulators. */
+type FrameSinks = {
+  onStdout: (payload: Uint8Array) => void;
+  /** end of the socket: `err` set = the exec did not complete cleanly. */
+  onEnd: (err: Error | null) => void;
+};
+
 /**
  * One exec WebSocket, in the k8s channel framing: every frame is
  * `[channel byte, ...payload]`. Channel 3 carries a metav1.Status JSON at the
  * end, which is where the remote exit code lives.
  */
-class ExecSocket {
+export class ExecSocket {
   private stdoutChunks: Uint8Array[] = [];
   private stderrText = "";
   private statusText = "";
   private closed = false;
+  private cancelled = false;
 
   constructor(
     private readonly ws: WebSocket,
     private readonly opts: ExecOpts,
   ) {}
+
+  /** Consumer went away: tear down without turning it into an error. */
+  cancel(): void {
+    this.cancelled = true;
+    this.close();
+  }
 
   close(): void {
     this.closed = true;
@@ -325,7 +348,7 @@ class ExecSocket {
 
   private frame(data: ArrayBuffer | string): { ch: number; payload: Uint8Array } | null {
     if (typeof data === "string") {
-      const bytes = new TextEncoder().encode(data);
+      const bytes = ENC.encode(data);
       return bytes.length ? { ch: bytes[0], payload: bytes.subarray(1) } : null;
     }
     const bytes = new Uint8Array(data);
@@ -352,6 +375,64 @@ class ExecSocket {
     }
   }
 
+  /**
+   * Non-null when the exec did NOT complete successfully — the one place both
+   * the buffered and the streaming path ask "was this a real success?".
+   * An absent status frame counts as a failure for the same reason exitCode()
+   * returns 255 for it: no status means the transport, not the command, ended.
+   */
+  private failure(): Error | null {
+    if (!this.statusText.trim()) {
+      return new Error("exec ended without a status frame — the connection dropped mid-stream");
+    }
+    const code = this.exitCode();
+    if (code === 0) return null;
+    const why = this.stderrText.trim().split("\n").filter(Boolean).pop();
+    return new Error(`exec exited ${code}${why ? `: ${why}` : ""}`);
+  }
+
+  /**
+   * The single frame-dispatch loop. stderr and the channel-3 status are always
+   * accumulated on the instance; only stdout is pluggable, which is the entire
+   * difference between collect() and pipeStdout(). timeoutMs is enforced here,
+   * so it works on both paths.
+   */
+  private dispatch(sinks: FrameSinks): void {
+    let ended = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const end = (err: Error | null) => {
+      if (ended) return;
+      ended = true;
+      if (timer) clearTimeout(timer);
+      sinks.onEnd(err);
+    };
+
+    if (this.opts.timeoutMs) {
+      timer = setTimeout(() => {
+        this.close();
+        end(new Error(`exec timed out after ${this.opts.timeoutMs}ms`));
+      }, this.opts.timeoutMs);
+    }
+
+    this.ws.onopen = () => {
+      this.pumpStdin().catch((e) => {
+        this.close();
+        end(e as Error);
+      });
+    };
+    this.ws.onmessage = (ev: MessageEvent) => {
+      const f = this.frame(ev.data as ArrayBuffer | string);
+      if (!f) return;
+      if (f.ch === CH_STDOUT) sinks.onStdout(f.payload);
+      else if (f.ch === CH_STDERR) this.stderrText += DEC.decode(f.payload);
+      else if (f.ch === CH_ERROR) this.statusText += DEC.decode(f.payload);
+    };
+    this.ws.onerror = () => {
+      /* close always follows; the status decides the outcome */
+    };
+    this.ws.onclose = () => end(null);
+  }
+
   private async pumpStdin(): Promise<void> {
     const src = this.opts.stdin;
     if (src === undefined) return;
@@ -367,7 +448,7 @@ class ExecSocket {
         await new Promise((r) => setTimeout(r, 10));
       }
     };
-    if (typeof src === "string") send(new TextEncoder().encode(src));
+    if (typeof src === "string") send(ENC.encode(src));
     else if (src instanceof Uint8Array) send(src);
     else {
       const reader = src.getReader();
@@ -391,65 +472,45 @@ class ExecSocket {
     }
   }
 
+  /** Buffered: the exit code is data, so a non-zero one resolves, not rejects. */
   collect(): Promise<ExecResult> {
     return new Promise<ExecResult>((resolve, reject) => {
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      const finish = () => {
-        if (timer) clearTimeout(timer);
-        const stdout = new TextDecoder().decode(concat(this.stdoutChunks));
-        resolve({ code: this.exitCode(), stdout, stderr: this.stderrText });
-      };
-      if (this.opts.timeoutMs) {
-        timer = setTimeout(() => {
-          this.close();
-          reject(new Error(`exec timed out after ${this.opts.timeoutMs}ms`));
-        }, this.opts.timeoutMs);
-      }
-      this.ws.onopen = () => {
-        this.pumpStdin().catch((e) => {
-          this.close();
-          reject(e);
-        });
-      };
-      this.ws.onmessage = (ev: MessageEvent) => {
-        const f = this.frame(ev.data as ArrayBuffer | string);
-        if (!f) return;
-        if (f.ch === CH_STDOUT) this.stdoutChunks.push(f.payload);
-        else if (f.ch === CH_STDERR) this.stderrText += new TextDecoder().decode(f.payload);
-        else if (f.ch === CH_ERROR) this.statusText += new TextDecoder().decode(f.payload);
-      };
-      this.ws.onerror = () => {
-        /* close always follows; the status decides the outcome */
-      };
-      this.ws.onclose = () => finish();
+      this.dispatch({
+        onStdout: (p) => this.stdoutChunks.push(p),
+        onEnd: (err) => {
+          if (err) return reject(err);
+          resolve({ code: this.exitCode(), stdout: DEC.decode(concat(this.stdoutChunks)), stderr: this.stderrText });
+        },
+      });
     });
   }
 
+  /**
+   * Streaming: the consumer sees bytes as they arrive, so a failure can only be
+   * signalled by erroring the stream. Closing it cleanly on a non-zero exit (or
+   * on a missing status frame) is what turned a half-written `tar` into a
+   * perfectly valid-looking 200 — never do that.
+   */
   pipeStdout(controller: ReadableStreamDefaultController<Uint8Array>): void {
-    this.ws.onopen = () => {
-      this.pumpStdin().catch(() => this.close());
-    };
-    this.ws.onmessage = (ev: MessageEvent) => {
-      const f = this.frame(ev.data as ArrayBuffer | string);
-      if (!f) return;
-      if (f.ch === CH_STDOUT && f.payload.length) {
+    this.dispatch({
+      onStdout: (payload) => {
+        if (!payload.length) return;
         try {
-          controller.enqueue(f.payload);
+          controller.enqueue(payload);
         } catch {
-          this.close();
+          this.cancel(); // the consumer already went away
         }
-      } else if (f.ch === CH_ERROR) {
-        this.statusText += new TextDecoder().decode(f.payload);
-      }
-    };
-    this.ws.onclose = () => {
-      try {
-        controller.close();
-      } catch {
-        /* already closed by a cancel */
-      }
-    };
-    this.ws.onerror = () => this.close();
+      },
+      onEnd: (err) => {
+        const problem = this.cancelled ? null : (err ?? this.failure());
+        try {
+          if (problem) controller.error(problem);
+          else controller.close();
+        } catch {
+          /* already closed or errored by a cancel */
+        }
+      },
+    });
   }
 }
 

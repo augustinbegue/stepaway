@@ -6,13 +6,20 @@ on:
     tags: ["v*"]
   pull_request:
 
+# Least privilege at the top; the image job widens it for itself only.
 permissions:
   contents: read
-  packages: write
+
+# One run per ref: a force-push supersedes the run it replaces.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -29,6 +36,9 @@ jobs:
     needs: test
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
       - id: ver
@@ -44,6 +54,8 @@ jobs:
           context: .
           file: server/Dockerfile
           push: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
           tags: |
             ghcr.io/${{ github.repository_owner }}/stepaway-server:${{ steps.ver.outputs.version }}
             ghcr.io/${{ github.repository_owner }}/stepaway-server:latest

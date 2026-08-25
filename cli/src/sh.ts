@@ -1,5 +1,4 @@
 import { spawn, spawnSync } from "node:child_process";
-import * as fs from "node:fs";
 
 export type RunResult = { code: number; stdout: string; stderr: string };
 
@@ -85,12 +84,10 @@ export function runAsync(
   });
 }
 
-/** Run a bash script locally. Extra args land in $1.. of the script. */
-export function bash(script: string, args: string[] = [], opts: { cwd?: string; env?: NodeJS.ProcessEnv } = {}): RunResult {
-  return run("bash", ["-c", script, "stepaway", ...args], opts);
-}
-
-/** Non-blocking bash(): same contract, resolves instead of blocking. */
+/**
+ * Run a bash script locally, without blocking the event loop. Extra args land
+ * in $1.. of the script.
+ */
 export function bashAsync(
   script: string,
   args: string[] = [],
@@ -99,11 +96,13 @@ export function bashAsync(
   return runAsync("bash", ["-c", script, "stepaway", ...args], opts);
 }
 
-export function must(r: RunResult, what: string): string {
-  if (r.code !== 0) {
-    throw new Error(`${what} failed (exit ${r.code})\n${r.stderr.trim() || r.stdout.trim()}`);
-  }
-  return r.stdout;
+/**
+ * Errors from local and remote scripts alike can be pages long; the last
+ * non-empty line is the news. Single implementation — every caller uses it.
+ */
+export function lastLine(s: string): string {
+  const lines = s.trim().split("\n").filter((l) => l.trim());
+  return lines.length ? lines[lines.length - 1] : "(no output)";
 }
 
 export function which(bin: string): boolean {
@@ -113,41 +112,6 @@ export function which(bin: string): boolean {
 /** POSIX single-quote shell escaping. */
 export function shq(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`;
-}
-
-export function isTTY(): boolean {
-  return Boolean(process.stdin.isTTY && process.stdout.isTTY);
-}
-
-/** Blocking single-line read from the controlling TTY (no deps). */
-export function ask(question: string): string {
-  process.stdout.write(question);
-  const buf = Buffer.alloc(4096);
-  let out = "";
-  let fd: number;
-  try {
-    fd = fs.openSync("/dev/tty", "rs");
-  } catch {
-    fd = 0;
-  }
-  for (;;) {
-    let n = 0;
-    try {
-      n = fs.readSync(fd, buf, 0, buf.length, null);
-    } catch {
-      break;
-    }
-    if (n <= 0) break;
-    out += buf.toString("utf8", 0, n);
-    if (out.includes("\n")) break;
-  }
-  return out.replace(/\r?\n[\s\S]*$/, "");
-}
-
-/** Blocking y/N prompt on the TTY (no deps). */
-export function confirm(question: string): boolean {
-  const ans = ask(question).trim().toLowerCase();
-  return ans === "y" || ans === "yes";
 }
 
 /**
@@ -172,8 +136,12 @@ export function spawnStream(
         buf = buf.slice(i + 1);
       }
     });
-    if (opts.onStderr) child.stderr.setEncoding("utf8"), child.stderr.on("data", opts.onStderr);
-    else child.stderr.resume();
+    if (opts.onStderr) {
+      child.stderr.setEncoding("utf8");
+      child.stderr.on("data", opts.onStderr);
+    } else {
+      child.stderr.resume();
+    }
     const done = (code: number) => {
       if (buf.trim()) onLine(buf);
       buf = "";

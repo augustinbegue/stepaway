@@ -92,11 +92,12 @@ ingress:
     # serve the Ingress without TLS.
     secretName: ""
 
-# -- Values consumed by the backend and passed straight through as
-# RUNNER_* environment variables. The backend uses these as defaults when it
-# builds the per-session runner pod template; they are not rendered into any
-# object owned by this chart (no CRDs, no operator — session pods are
-# created imperatively by the backend).
+# -- Passed to the backend as RUNNER_* environment variables (see
+# server/src/config.ts: RUNNER_ENV_NAMES, which a test keeps in sync with the
+# Deployment template). The backend applies them when it builds each
+# per-session runner pod; nothing here is rendered into an object owned by
+# this chart (no CRDs, no operator — session pods are created imperatively by
+# the backend).
 runner:
   # Boot-installs claude/bun/compose at start (~60-90s). The prebaked
   # ghcr.io/augustinbegue/stepaway-runner template image replaces this once
@@ -106,10 +107,17 @@ runner:
     cpuRequest: 250m
     memRequest: 512Mi
     memLimit: 2Gi
+  # -- StorageClass for the per-session PVC. Empty = the backend default
+  # ("longhorn"); set it to your cluster's class.
   storageClass: ""
   pvc:
+    # -- Size of the per-session PVC (holds the git dir, not the work tree).
     size: 5Gi
   dind:
+    # -- Docker-in-Docker sidecar in every runner pod. Set to false on
+    # clusters that refuse privileged containers: runners then have no docker
+    # daemon, so `stepaway doctor` reports dind as failing and captures that
+    # carried a compose project cannot restore it.
     enabled: true
 
 # -- Opt-in governance for session (runner) pods. Everything here is
