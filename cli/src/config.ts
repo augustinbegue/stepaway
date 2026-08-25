@@ -62,6 +62,7 @@ export function loadConfig(root: string): ProjectConfig {
   const raw = loadRawConfig(root);
   const cfg: ProjectConfig = { ...DEFAULT_CONFIG, server: null, ...(raw as Partial<ProjectConfig>) };
   cfg.server = typeof raw.server === "string" && raw.server.trim() ? raw.server.trim() : null;
+  cfg.image = typeof raw.image === "string" && raw.image.trim() ? raw.image.trim() : null;
   if (!Array.isArray(cfg.excludeGlobs)) cfg.excludeGlobs = [];
   if (raw.env && typeof raw.env === "object") {
     cfg.env = {

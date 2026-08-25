@@ -5,6 +5,7 @@ import { detectSetup } from "../setup.js";
 import { findComposeFile } from "../docker.js";
 import { readClientConfig } from "../clientconfig.js";
 import { Ui } from "../ui.js";
+import { previewRunnerEnv } from "../envspec.js";
 
 /**
  * Write `.stepaway.json`. v0.2: no namespace/pod/context — the CLI addresses a
@@ -29,9 +30,14 @@ export async function cmdInit(args: string[], flags: Record<string, any>): Promi
   const compose = findComposeFile(root, cfg.composeFile);
   if (compose) patch.composeFile = compose;
   if (cfg.setup !== null) patch.setup = cfg.setup;
+  // "image" is only ever written when the user already set one: an empty key
+  // would look like a knob you must fill in, when the default (devcontainer,
+  // else the generic runner image) is the right answer for most projects.
+  if (cfg.image) patch.image = cfg.image;
   patchConfig(root, patch);
 
   const setup = cfg.setup ?? detectSetup(root);
+  const env = previewRunnerEnv(root, cfg.image);
   const global = readClientConfig();
   if (flags.json) {
     ui.raw(JSON.stringify({ path: p, updated: existed, config: loadConfig(root) }, null, 2) + "\n");
@@ -42,6 +48,9 @@ export async function cmdInit(args: string[], flags: Record<string, any>): Promi
         `  remote working tree: ${remoteProjectPath(cfg, root)} (one pod per session)\n` +
         `  compose file: ${compose ?? "(none)"}\n` +
         `  setup: ${setup ?? "(none detected)"}\n` +
+        `  runner environment: ${env}\n` +
+        `    set "image": "<ref>" in ${p} to pin an explicit runner image;\n` +
+        `    otherwise a .devcontainer/devcontainer.json is built and cached on the cluster.\n` +
         `next: stepaway auth, then stepaway doctor\n`,
     );
   }

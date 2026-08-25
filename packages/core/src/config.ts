@@ -32,6 +32,12 @@ export type StepawayConfig = {
   excludeGlobs: string[];
   /** command run in the restored working tree before launch; null = autodetect. */
   setup: string | null;
+  /**
+   * v0.3 env resolution step 1: an explicit runner image, run as-is. Wins over
+   * a repo `.devcontainer/`; null/absent falls through to devcontainer, then to
+   * the backend's generic runner image.
+   */
+  image?: string | null;
   /** remembered env-carry decisions; null = never asked. */
   env: EnvConfig | null;
 };
@@ -43,6 +49,7 @@ export const DEFAULT_CONFIG: StepawayConfig = {
   composeFile: null,
   excludeGlobs: [],
   setup: null,
+  image: null,
   env: null,
 };
 

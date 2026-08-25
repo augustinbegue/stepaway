@@ -196,29 +196,53 @@ export class Client {
   }
 
   /**
-   * Poll `GET /sessions/:id` until the state leaves `pending`. This is the
-   * backend's absorbed waitRunner (spec §3): claude-version polling on the
-   * runner is the pending → ready edge, and we only see the edge.
+   * Poll `GET /sessions/:id` until the state leaves `pending`/`building`. This
+   * is the backend's absorbed waitRunner (spec §3): claude-version polling on
+   * the runner is the pending → ready edge, and we only see the edge.
+   *
+   * v1.2: `building` (devcontainer env image) is non-terminal too, and gets its
+   * own, much longer budget — a cold image build is minutes, not seconds.
    */
   async waitReady(
     id: string,
-    o: { timeoutMs?: number; onState?: (s: Session) => void; intervalMs?: number } = {},
+    o: {
+      timeoutMs?: number;
+      /** budget for the `building` state alone; SPEC-v0.3 caps the Job at 1200s. */
+      buildTimeoutMs?: number;
+      onState?: (s: Session) => void;
+      intervalMs?: number;
+    } = {},
   ): Promise<Session> {
-    const deadline = Date.now() + (o.timeoutMs ?? 300_000);
+    const pendingMs = o.timeoutMs ?? 300_000;
+    const buildMs = o.buildTimeoutMs ?? 1_320_000;
+    // first time we saw each non-terminal state: each gets its own clock, so a
+    // long build never eats the runner-boot budget that follows it.
+    const since: Record<string, number> = {};
     for (;;) {
       const s = await this.getSession(id);
       o.onState?.(s);
       if (s.state === "failed") {
         throw new ApiError(`session ${id} failed`, 0, s.detail ?? "no detail from the backend");
       }
-      if (s.state !== "pending") return s;
-      if (Date.now() > deadline) {
-        throw new ApiError(
-          `runner ${s.podName || id} still pending after ${Math.round((o.timeoutMs ?? 300_000) / 1000)}s`,
-          0,
-          "check the backend: stepaway doctor",
-        );
-      }
+      if (s.state === "building") {
+        since.building ??= Date.now();
+        if (Date.now() - since.building > buildMs) {
+          throw new ApiError(
+            `env image for session ${id} still building after ${Math.round(buildMs / 1000)}s`,
+            0,
+            "the build Job is stuck or the registry is unreachable: stepaway doctor",
+          );
+        }
+      } else if (s.state === "pending") {
+        since.pending ??= Date.now();
+        if (Date.now() - since.pending > pendingMs) {
+          throw new ApiError(
+            `runner ${s.podName || id} still pending after ${Math.round(pendingMs / 1000)}s`,
+            0,
+            "check the backend: stepaway doctor",
+          );
+        }
+      } else return s;
       await sleep(o.intervalMs ?? 2000);
     }
   }

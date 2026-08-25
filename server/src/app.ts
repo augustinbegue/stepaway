@@ -43,18 +43,54 @@ import {
   type RunRequest,
   type RunResponse,
   type Session,
+  type SessionState,
   type VersionResponse,
 } from "@stepaway/core";
 import type { K8s, PodObject } from "./k8s.js";
-import { ANN, DEFAULT_REMOTE_BASE, gitDirOf, remoteBaseOf, setState, toSession, workTreeOf } from "./sessions.js";
+import {
+  ANN,
+  DEFAULT_REMOTE_BASE,
+  findSessionRecord,
+  gitDirOf,
+  listSessionRecords,
+  podRecord,
+  remoteBaseOf,
+  setRecordState,
+  setState,
+  toSession,
+  workTreeOf,
+} from "./sessions.js";
 import { bashLine, bashScript, lastLine, shq, tail } from "./sh.js";
 import { VERSION, type ServerConfig } from "./config.js";
+import {
+  buildJobName,
+  buildLogTail,
+  cleanupEnvSpec,
+  ensureBuildJob,
+  envImageRef,
+  jobFailureReason,
+  jobOutcome,
+  putEnvSpecSecret,
+  registryManifestCheck,
+  validateEnvSpec,
+  type ManifestCheck,
+} from "./build.js";
+
+/** What the build watcher needs to finish a `building` session. */
+export type BuildWatch = { name: string; sessionId: string; hash: string };
 
 export type AppDeps = {
   k8s: K8s;
   config: ServerConfig;
   /** injectable for tests; the real one polls claude --version. */
   onSessionCreated?: (podName: string) => void;
+  /**
+   * Called when a session enters `building`. The real one polls the Job (same
+   * shape as the pending->ready poll); tests drive advanceBuild() by hand.
+   */
+  onBuildStarted?: (watch: BuildWatch) => void;
+  /** injectable registry cache probe; defaults to the configured registry. */
+  manifestCheck?: ManifestCheck;
 };
 
 /** HOME in the runner (podspec.ts pins it). */
@@ -67,6 +103,7 @@ const SHORT_TIMEOUT_MS = 30_000;
 export function createApp(deps: AppDeps) {
   const { k8s, config } = deps;
   const app = new Hono();
+  const manifestCheck = resolveManifestCheck(deps);
 
   const fail = (c: Context, status: ContentfulStatusCode, error: string, detail?: string) =>
     c.json(detail ? { error, detail } : { error }, status);
@@ -101,63 +138,121 @@ export function createApp(deps: AppDeps) {
     const name = podName(body.sessionId);
     const remoteBase = (body.options?.remotePathBase || DEFAULT_REMOTE_BASE).replace(/\/+$/, "") || "/";
 
-    const existing = await k8s.getPod(name);
+    // Idempotent per sessionId — including while the env image is still
+    // building, when the session is a PVC and nothing else.
+    const existing = await findSessionRecord(k8s, name);
     if (existing) {
-      const had = existing.metadata.annotations?.[ANN.project];
+      const had = existing.object.metadata.annotations?.[ANN.project];
       if (had && had !== project) {
         return fail(c, 409, "session exists", `${body.sessionId} already holds project "${had}", not "${project}"`);
       }
-      // Idempotent per sessionId: same id + same project is the same session.
       return c.json<Session>(await toSession(k8s, existing), 200);
     }
 
-    const annotations = {
+    // ---- env resolution (SPEC-v0.3): image > envSpec > default -----------
+    let image = body.options?.image?.trim() || undefined;
+    let pullSecrets: string[] = [];
+    let warning: string | undefined;
+    let building: { hash: string } | undefined;
+    const spec = body.envSpec;
+
+    if (!image && spec) {
+      if (!config.registry.host || !manifestCheck) {
+        // Spec: fall through to the generic image, but say so.
+        warning = "no cluster registry configured: the devcontainer env was ignored, using the default runner image";
+      } else {
+        const check = validateEnvSpec(spec);
+        if (!check.ok) return fail(c, 400, "invalid envSpec", check.detail);
+        let cached: boolean;
+        try {
+          cached = await manifestCheck(spec.hash);
+        } catch (e) {
+          return fail(c, 502, "registry unavailable", (e as Error).message);
+        }
+        image = envImageRef(config.registry.host, spec.hash);
+        pullSecrets = [config.registry.pullSecret];
+        if (!cached) building = { hash: spec.hash };
+      }
+    }
+
+    const annotations: Record<string, string> = {
       [ANN.project]: project,
       [ANN.createdAt]: new Date().toISOString(),
-      [ANN.state]: "pending",
+      [ANN.state]: building ? "building" : "pending",
       [ANN.remoteBase]: remoteBase,
+      ...(spec && image ? { [ANN.envHash]: spec.hash } : {}),
+      ...(image ? { [ANN.image]: image } : {}),
+      ...(pullSecrets.length ? { [ANN.pullSecret]: pullSecrets[0] } : {}),
+      ...(warning ? { [ANN.detail]: warning } : {}),
     };
+
     try {
+      // The PVC comes first in both flows: it carries the session label, so it
+      // is what a `building` session *is* until its pod exists.
       await k8s.createFromYaml(
         "persistentvolumeclaims",
         pvcManifest({ name, sessionId: body.sessionId, ...config.runner, annotations }),
       );
-      await k8s.createFromYaml(
-        "pods",
-        podManifest({ name, sessionId: body.sessionId, secretName: AUTH_SECRET, ...config.runner, annotations }),
-      );
+      if (building) {
+        await putEnvSpecSecret(k8s, spec!);
+        await ensureBuildJob(k8s, { hash: building.hash, registry: config.registry });
+      } else {
+        await k8s.createFromYaml(
+          "pods",
+          podManifest({
+            name,
+            sessionId: body.sessionId,
+            secretName: AUTH_SECRET,
+            ...config.runner,
+            ...(image ? { image } : {}),
+            imagePullSecrets: pullSecrets,
+            annotations,
+          }),
+        );
+      }
     } catch (e) {
-      return fail(c, 502, "could not create the runner", (e as Error).message);
+      return fail(c, 502, building ? "could not start the env build" : "could not create the runner", (e as Error).message);
     }
-    deps.onSessionCreated?.(name);
-    const pod = (await k8s.getPod(name)) ?? {
-      metadata: { name, labels: { [SESSION_LABEL]: body.sessionId }, annotations },
-    };
-    return c.json<Session>(await toSession(k8s, pod, { probe: false }), 201);
+
+    if (building) {
+      deps.onBuildStarted?.({ name, sessionId: body.sessionId, hash: building.hash });
+    } else {
+      deps.onSessionCreated?.(name);
+    }
+
+    const fresh =
+      (await findSessionRecord(k8s, name)) ??
+      podRecord({ metadata: { name, labels: { [SESSION_LABEL]: body.sessionId }, annotations } });
+    return c.json<Session>(await toSession(k8s, fresh, { probe: false }), 201);
   });
 
   // Annotations only: probing here is one exec per pod, serially, on every
   // `stepaway ls`. GET /sessions/:id is the endpoint that derives, and the CLI
   // already calls it for the session it cares about.
   app.get("/v1/sessions", async (c) => {
-    const pods = await k8s.listPods(SESSION_LABEL);
+    // Records, not pods: a `building` session has no pod yet and must still
+    // show up in `stepaway ls`.
+    const records = await listSessionRecords(k8s);
     const out: Session[] = [];
-    for (const p of pods) out.push(await toSession(k8s, p, { probe: false }));
+    for (const r of records) out.push(await toSession(k8s, r, { probe: false }));
     out.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
     return c.json<Session[]>(out);
   });
 
   app.get("/v1/sessions/:id", async (c) => {
-    const pod = await requirePod(c);
-    if (!pod) return notFound(c);
-    return c.json<Session>(await toSession(k8s, pod));
+    const rec = await findSessionRecord(k8s, podName(sessionParam(c)));
+    if (!rec) return notFound(c);
+    return c.json<Session>(await toSession(k8s, rec));
   });
 
   app.delete("/v1/sessions/:id", async (c) => {
     const name = podName(sessionParam(c));
-    const pod = await k8s.getPod(name);
-    if (!pod) return notFound(c);
-    await k8s.deletePod(name);
+    const rec = await findSessionRecord(k8s, name);
+    if (!rec) return notFound(c);
+    if (rec.kind === "pod") await k8s.deletePod(name);
+    const hash = rec.object.metadata.annotations?.[ANN.envHash];
+    // A session abandoned mid-build owns a Secret nothing else will clean.
+    if (hash && rec.kind === "pvc") await cleanupEnvSpec(k8s, hash);
     await k8s.deletePvc(name);
     return c.json<DeleteSessionResponse>({ ok: true, podName: name });
   });
@@ -419,6 +514,14 @@ export function createApp(deps: AppDeps) {
       ["create", "pods", "exec"],
       ["create", "persistentvolumeclaims", undefined],
       ["create", "secrets", undefined],
+      // SPEC-v0.3 RBAC additions: only required when the devcontainer path is
+      // actually enabled, so a registry-less install is not told it is broken.
+      ...(config.registry.host
+        ? ([
+            ["create", "jobs", undefined],
+            ["delete", "secrets", undefined],
+          ] as [string, string, string | undefined][])
+        : []),
     ];
     const missing: string[] = [];
     for (const [verb, resource, sub] of rbac) {
@@ -509,6 +612,80 @@ export function createApp(deps: AppDeps) {
 }
 
 export type App = ReturnType<typeof createApp>;
+
+/** The configured registry probe, or null when the devcontainer path is off. */
+export function resolveManifestCheck(deps: AppDeps): ManifestCheck | null {
+  if (deps.manifestCheck) return deps.manifestCheck;
+  return deps.config.registry.host ? registryManifestCheck(deps.config.registry) : null;
+}
+
+/**
+ * One step of the `building` watch: look at the Job, and either leave the
+ * session building, boot its pod from the freshly pushed image, or fail it
+ * with the builder's log tail.
+ *
+ * Deliberately a single idempotent step rather than a loop, so the polling
+ * lives in server.ts (next to the pending->ready poll it mirrors) and the
+ * tests can drive the transitions without timers.
+ */
+export async function advanceBuild(deps: AppDeps, w: BuildWatch): Promise<SessionState | "gone"> {
+  const { k8s, config } = deps;
+  const rec = await findSessionRecord(k8s, w.name);
+  if (!rec) return "gone";
+  // The pod exists: someone already finished this build (or the user recreated
+  // the session). Nothing left to watch.
+  if (rec.kind === "pod") return "pending";
+  const state = rec.object.metadata.annotations?.[ANN.state];
+  if (state !== "building") return (state as SessionState) ?? "gone";
+
+  const job = await k8s.getJob(buildJobName(w.hash)).catch(() => null);
+  let outcome = jobOutcome(job);
+  if (outcome === "running") return "building";
+  if (outcome === "gone") {
+    // ttlSecondsAfterFinished can reap a *successful* Job before we look. The
+    // registry is the truth: if the image is there, the build worked.
+    const check = resolveManifestCheck(deps);
+    const pushed = check ? await check(w.hash).catch(() => false) : false;
+    outcome = pushed ? "succeeded" : "failed";
+  }
+
+  if (outcome === "succeeded") {
+    await cleanupEnvSpec(k8s, w.hash);
+    const ann = { ...(rec.object.metadata.annotations ?? {}) };
+    const image = ann[ANN.image] || envImageRef(config.registry.host, w.hash);
+    const pullSecret = ann[ANN.pullSecret] || config.registry.pullSecret;
+    const podAnn: Record<string, string> = { ...ann, [ANN.state]: "pending" };
+    delete podAnn[ANN.detail];
+    try {
+      await k8s.createFromYaml(
+        "pods",
+        podManifest({
+          name: w.name,
+          sessionId: w.sessionId,
+          secretName: AUTH_SECRET,
+          ...config.runner,
+          image,
+          imagePullSecrets: pullSecret ? [pullSecret] : [],
+          annotations: podAnn,
+        }),
+      );
+    } catch (e) {
+      await setRecordState(k8s, rec, "failed", { [ANN.detail]: `could not start the runner: ${(e as Error).message}` });
+      return "failed";
+    }
+    // The PVC keeps a stale annotation for a moment; the pod is authoritative
+    // from here on (findSessionRecord prefers it), but keep them consistent.
+    await setRecordState(k8s, rec, "pending", { [ANN.detail]: null });
+    deps.onSessionCreated?.(w.name);
+    return "pending";
+  }
+
+  const detail =
+    (await buildLogTail(k8s, w.hash)) || jobFailureReason(job) || "the devcontainer build failed with no output";
+  await cleanupEnvSpec(k8s, w.hash);
+  await setRecordState(k8s, rec, "failed", { [ANN.detail]: detail.slice(-400) });
+  return "failed";
+}
 
 /** The `:id` path param, always a string. */
 function sessionParam(c: Context): string {

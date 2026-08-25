@@ -27,7 +27,7 @@ import {
   type Session,
   type SessionState,
 } from "@stepaway/core";
-import type { K8s, PodObject } from "./k8s.js";
+import type { K8s, PodObject, PvcObject } from "./k8s.js";
 import { bashLine } from "./sh.js";
 
 export const ANN = {
@@ -38,9 +38,83 @@ export const ANN = {
   workTree: "stepaway.dev/work-tree",
   exitCode: "stepaway.dev/exit-code",
   detail: "stepaway.dev/detail",
+  /** v0.3: devcontainer env hash this session's image is (being) built from. */
+  envHash: "stepaway.dev/env-hash",
+  /** v0.3: image the session pod runs (or will run, while `building`). */
+  image: "stepaway.dev/image",
+  /** v0.3: imagePullSecret for that image, "" for the public default. */
+  pullSecret: "stepaway.dev/pull-secret",
 } as const;
 
 export { DEFAULT_REMOTE_BASE };
+
+/**
+ * Where a session's state lives.
+ *
+ * Normally: the runner pod's annotations. But SPEC-v0.3 adds `building`, a
+ * state that exists precisely *because* there is no pod yet — the env image is
+ * still being built. The PVC is created first (it already carries the session
+ * label), so it is the natural home for the pre-pod annotations. Everything
+ * downstream reads a `SessionRecord` and stops caring which of the two it is.
+ */
+export type SessionRecord = { kind: "pod" | "pvc"; object: PodObject };
+
+export const podRecord = (object: PodObject): SessionRecord => ({ kind: "pod", object });
+export const pvcRecord = (object: PvcObject): SessionRecord => ({ kind: "pvc", object: object as PodObject });
+
+/** The pod if it exists, else the PVC standing in for a pre-pod session. */
+export async function findSessionRecord(k8s: K8s, name: string): Promise<SessionRecord | null> {
+  const pod = await k8s.getPod(name);
+  if (pod) return podRecord(pod);
+  const pvc = await k8s.getPvc(name).catch(() => null);
+  // A PVC with no state annotation is just storage mid-create, not a session.
+  if (pvc?.metadata.annotations?.[ANN.state]) return pvcRecord(pvc);
+  return null;
+}
+
+/** Every session: the pods, plus the PVCs whose pod does not exist yet. */
+export async function listSessionRecords(k8s: K8s): Promise<SessionRecord[]> {
+  const pods = await k8s.listPods(SESSION_LABEL);
+  const out = pods.map(podRecord);
+  const seen = new Set(pods.map((p) => p.metadata.name));
+  let pvcs: PvcObject[] = [];
+  try {
+    pvcs = await k8s.listPvcs(SESSION_LABEL);
+  } catch {
+    pvcs = []; // listing PVCs must never break `stepaway ls`
+  }
+  for (const pvc of pvcs) {
+    if (seen.has(pvc.metadata.name)) continue;
+    if (!pvc.metadata.annotations?.[ANN.state]) continue;
+    out.push(pvcRecord(pvc));
+  }
+  return out;
+}
+
+/** Annotation write against whichever object currently holds the state. */
+export async function patchRecord(k8s: K8s, rec: SessionRecord, ann: Record<string, string | null>): Promise<void> {
+  try {
+    if (rec.kind === "pod") await k8s.patchPodAnnotations(rec.object.metadata.name, ann);
+    else await k8s.patchPvcAnnotations(rec.object.metadata.name, ann);
+  } catch {
+    // best-effort, exactly like patch() below
+  }
+  const merged = { ...(rec.object.metadata.annotations ?? {}) };
+  for (const [k, v] of Object.entries(ann)) {
+    if (v === null) delete merged[k];
+    else merged[k] = v;
+  }
+  rec.object.metadata.annotations = merged;
+}
+
+export async function setRecordState(
+  k8s: K8s,
+  rec: SessionRecord,
+  state: SessionState,
+  extra: Record<string, string | null> = {},
+): Promise<void> {
+  await patchRecord(k8s, rec, { [ANN.state]: state, ...extra });
+}
 
 /** The session's remote base (`remotePathBase` at create time), default /work. */
 export function remoteBaseOf(pod: PodObject): string {
@@ -48,7 +122,7 @@ export function remoteBaseOf(pod: PodObject): string {
   return raw.replace(/\/+$/, "") || "/";
 }
 
-const STATES: SessionState[] = ["pending", "restoring", "ready", "running", "done", "failed"];
+const STATES: SessionState[] = ["building", "pending", "restoring", "ready", "running", "done", "failed"];
 
 function annotationState(pod: PodObject): SessionState {
   const raw = pod.metadata.annotations?.[ANN.state];
@@ -80,14 +154,17 @@ function podReady(pod: PodObject): boolean {
  * `probe: false` skips the exec probes — used by list when the caller only
  * wants what the annotations already say.
  */
-export async function toSession(k8s: K8s, pod: PodObject, opts: { probe?: boolean } = {}): Promise<Session> {
+export async function toSession(k8s: K8s, rec: SessionRecord, opts: { probe?: boolean } = {}): Promise<Session> {
+  const pod = rec.object;
   const a = pod.metadata.annotations ?? {};
   const name = pod.metadata.name;
   let state = annotationState(pod);
   let exitCode: number | null | undefined = a[ANN.exitCode] !== undefined ? Number(a[ANN.exitCode]) : undefined;
   let detail = a[ANN.detail];
 
-  if (opts.probe !== false && !pod.metadata.deletionTimestamp) {
+  // A `building` session has no pod to exec into: its transitions are driven
+  // by the build watcher, never derived here.
+  if (opts.probe !== false && rec.kind === "pod" && !pod.metadata.deletionTimestamp) {
     if (state === "pending" && podReady(pod)) {
       // pending -> ready: claude installs at boot, so pod-Ready is not enough.
       const r = await safeExec(k8s, name, bashLine("claude --version"));

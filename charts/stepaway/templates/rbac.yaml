@@ -23,10 +23,16 @@ rules:
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
     verbs: ["get", "list", "create", "delete"]
-  # Auth/env-carry secrets minted per session (stepaway-auth pattern).
+  # Auth/env-carry secrets minted per session (stepaway-auth pattern), plus
+  # the per-build envspec Secrets, which the backend also deletes.
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["get", "create", "patch"]
+    verbs: ["get", "create", "patch", "delete"]
+  # Devcontainer env-image build Jobs (SPEC-v0.3). Harmless when the registry
+  # component is disabled: the backend then never creates a Job.
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "delete"]
   # Surfacing session lifecycle to `kubectl describe` / `stepaway status`.
   - apiGroups: [""]
     resources: ["events"]

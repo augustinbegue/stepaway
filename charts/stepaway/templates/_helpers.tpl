@@ -74,6 +74,19 @@ Name of the bearer-token Secret.
 {{- end }}
 
 {{/*
+Name of the docker-registry subchart's objects (Service/Deployment/PVC).
+Mirrors the subchart's own `docker-registry.fullname`, with the dependency
+aliased to `registry` (so .Chart.Name inside it is "registry").
+*/}}
+{{- define "stepaway.registryFullname" -}}
+{{- if contains "registry" .Release.Name }}
+{{- .Release.Name | trunc 63 | trimSuffix "-" }}
+{{- else }}
+{{- printf "%s-registry" .Release.Name | trunc 63 | trimSuffix "-" }}
+{{- end }}
+{{- end }}
+
+{{/*
 Backend image reference.
 */}}
 {{- define "stepaway.image" -}}

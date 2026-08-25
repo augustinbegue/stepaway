@@ -160,3 +160,112 @@ networkPolicy:
   # rule is added, so the policy only restricts ingress). Example to
   # restrict runners to DNS + private ranges is documented in README.md.
   runnerEgress: []
+
+# -- Image of the build Job the backend creates on an env-image cache miss
+# (see registry.* below). Only used when registry.enabled=true.
+builder:
+  image: ghcr.io/augustinbegue/stepaway-builder:latest
+
+# In-cluster OCI registry for devcontainer environment images (SPEC-v0.3).
+#
+# This whole block is the values surface of the `docker-registry` subchart
+# (twuni), aliased to `registry` — anything documented at
+# https://github.com/twuni/docker-registry.helm can be set here. The keys
+# stepaway itself reads are `enabled`, `host` and `expose` (the subchart
+# ignores those three).
+#
+# When enabled, the chart:
+#   - mints a random `stepaway` user/password in Secret
+#     <registry.auth.secretName> (preserved across upgrades) and wires it into
+#     the registry as htpasswd auth,
+#   - creates a dockerconfigjson Secret <registry.pullSecretName> used as an
+#     imagePullSecret on session pods,
+#   - renders an Ingress for `registry.host`,
+#   - sets REGISTRY_HOST / REGISTRY_USER / REGISTRY_PASS /
+#     REGISTRY_PULL_SECRET / BUILDER_IMAGE on the backend.
+# When disabled, none of that is rendered and the backend sees no
+# REGISTRY_HOST, which turns the devcontainer path off (sessions fall back to
+# an explicit image or the generic base).
+registry:
+  enabled: false
+
+  # -- REQUIRED when registry.enabled=true. Public DNS name of the registry,
+  # host[:port], no scheme (e.g. registry.stepaway.dev).
+  #
+  # WHY A REAL DNS NAME AND NOT A CLUSTER SERVICE NAME: the pull of a session's
+  # env image is done by the *kubelet*, not by a pod. Kubelets run on the node
+  # host, outside the cluster DNS search path and outside the pod network, so
+  # `stepaway-registry.<ns>.svc.cluster.local:5000` is not resolvable/pullable
+  # for them. The supported topology is therefore: a name that resolves for the
+  # nodes, served over TLS by your ingress controller (cert-manager or any
+  # pre-created TLS Secret). A node-local /etc/hosts entry or an
+  # insecure-registry containerd config also works, but is on you.
+  host: ""
+
+  # Ingress rendered by stepaway (not by the subchart) so that the host is
+  # taken from registry.host and stays a single source of truth.
+  expose:
+    # -- Render an Ingress for registry.host. Turn this off only if you expose
+    # the registry some other way (LoadBalancer, node-local mirror...).
+    enabled: true
+    className: ""
+    annotations: {}
+    tls:
+      # -- Name of a TLS Secret for registry.host (cert-manager or
+      # pre-created). Empty = no TLS block, which almost never works: docker
+      # refuses plain-HTTP registries unless every node opts in.
+      secretName: ""
+
+  # -- Name of the Secret holding the registry credentials: keys `username`,
+  # `password` (plaintext, consumed by the backend and the build Jobs) and
+  # `htpasswd` (bcrypt line, mounted into the registry). Preserved across
+  # upgrades via lookup(), like the backend bearer token.
+  auth:
+    secretName: stepaway-registry-auth
+    # -- Force a new registry password on the next upgrade.
+    regeneratePassword: false
+
+  # -- Name of the dockerconfigjson Secret used as imagePullSecret on session
+  # pods. FROZEN: the backend receives this name as REGISTRY_PULL_SECRET.
+  pullSecretName: stepaway-registry-pull
+
+  # --- subchart values below (docker-registry) ------------------------------
+
+  persistence:
+    enabled: true
+    size: 20Gi
+    # -- StorageClass for the registry PVC. Empty = cluster default.
+    storageClass: ""
+    accessMode: ReadWriteOnce
+    # -- Needed for `registry garbage-collect --delete-untagged` to reclaim
+    # space; GC itself is a manual op (see README).
+    deleteEnabled: true
+
+  # The subchart's own Ingress stays off: stepaway renders it from
+  # registry.host (see registry.expose above).
+  ingress:
+    enabled: false
+
+  # Auth is wired from <registry.auth.secretName> instead of the subchart's
+  # `secrets.htpasswd` value, because the password is generated at render time
+  # and Helm cannot template subchart values.
+  secrets:
+    htpasswd: ""
+  extraEnvVars:
+    - name: REGISTRY_AUTH
+      value: htpasswd
+    - name: REGISTRY_AUTH_HTPASSWD_REALM
+      value: stepaway
+    - name: REGISTRY_AUTH_HTPASSWD_PATH
+      value: /auth/htpasswd
+  extraVolumes:
+    - name: stepaway-registry-auth
+      secret:
+        secretName: stepaway-registry-auth
+        items:
+          - key: htpasswd
+            path: htpasswd
+  extraVolumeMounts:
+    - name: stepaway-registry-auth
+      mountPath: /auth
+      readOnly: true

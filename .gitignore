@@ -1,2 +1,6 @@
 node_modules/
 *.tgz
+# Vendored Helm subchart(s): committed on purpose (helm.twun.io, the chart repo
+# the docker-registry dependency points at, does not currently resolve, so
+# `helm dependency update` cannot fetch it at install/CI time).
+!charts/stepaway/charts/*.tgz

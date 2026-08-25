@@ -160,14 +160,14 @@ var require_picocolors = __commonJS((exports, module) => {
 });
 
 // src/stepaway.ts
-import * as os6 from "node:os";
-import * as path15 from "node:path";
+import * as os7 from "node:os";
+import * as path16 from "node:path";
 
 // src/commands/push.ts
 import { randomUUID } from "node:crypto";
-import * as fs8 from "node:fs";
-import * as os2 from "node:os";
-import * as path9 from "node:path";
+import * as fs9 from "node:fs";
+import * as os3 from "node:os";
+import * as path10 from "node:path";
 
 // src/sh.ts
 import { spawn, spawnSync } from "node:child_process";
@@ -2078,6 +2078,7 @@ var DEFAULT_CONFIG = {
   composeFile: null,
   excludeGlobs: [],
   setup: null,
+  image: null,
   env: null
 };
 function excludePrefixes(cfg) {
@@ -2730,7 +2731,7 @@ import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
 // src/version.ts
-var VERSION = "0.3.1";
+var VERSION = "0.4.0";
 
 // src/client.ts
 class ApiError extends Error {
@@ -2886,18 +2887,27 @@ class Client {
     return new Set(Array.isArray(r2?.satisfied) ? r2.satisfied : []);
   }
   async waitReady(id, o2 = {}) {
-    const deadline = Date.now() + (o2.timeoutMs ?? 300000);
+    const pendingMs = o2.timeoutMs ?? 300000;
+    const buildMs = o2.buildTimeoutMs ?? 1320000;
+    const since = {};
     for (;; ) {
       const s = await this.getSession(id);
       o2.onState?.(s);
       if (s.state === "failed") {
         throw new ApiError(`session ${id} failed`, 0, s.detail ?? "no detail from the backend");
       }
-      if (s.state !== "pending")
+      if (s.state === "building") {
+        since.building ??= Date.now();
+        if (Date.now() - since.building > buildMs) {
+          throw new ApiError(`env image for session ${id} still building after ${Math.round(buildMs / 1000)}s`, 0, "the build Job is stuck or the registry is unreachable: stepaway doctor");
+        }
+      } else if (s.state === "pending") {
+        since.pending ??= Date.now();
+        if (Date.now() - since.pending > pendingMs) {
+          throw new ApiError(`runner ${s.podName || id} still pending after ${Math.round(pendingMs / 1000)}s`, 0, "check the backend: stepaway doctor");
+        }
+      } else
         return s;
-      if (Date.now() > deadline) {
-        throw new ApiError(`runner ${s.podName || id} still pending after ${Math.round((o2.timeoutMs ?? 300000) / 1000)}s`, 0, "check the backend: stepaway doctor");
-      }
       await sleep(o2.intervalMs ?? 2000);
     }
   }
@@ -3078,6 +3088,7 @@ function loadConfig(root) {
   const raw = loadRawConfig(root);
   const cfg = { ...DEFAULT_CONFIG, server: null, ...raw };
   cfg.server = typeof raw.server === "string" && raw.server.trim() ? raw.server.trim() : null;
+  cfg.image = typeof raw.image === "string" && raw.image.trim() ? raw.image.trim() : null;
   if (!Array.isArray(cfg.excludeGlobs))
     cfg.excludeGlobs = [];
   if (raw.env && typeof raw.env === "object") {
@@ -3499,6 +3510,103 @@ function resolveSetup(dir, configured) {
   return detectSetup(dir);
 }
 
+// src/envspec.ts
+import { createHash } from "node:crypto";
+import * as fs8 from "node:fs";
+import * as os2 from "node:os";
+import * as path9 from "node:path";
+var ENVSPEC_MAX_BYTES = 1024 * 1024;
+var DEVCONTAINER_DIR = ".devcontainer";
+var BARE_FILE = ".devcontainer.json";
+function walk(root, rel, out) {
+  let entries;
+  try {
+    entries = fs8.readdirSync(path9.join(root, rel), { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const e of entries) {
+    const child = `${rel}/${e.name}`;
+    if (e.isDirectory())
+      walk(root, child, out);
+    else if (e.isFile())
+      out.push(child);
+  }
+}
+function devcontainerFiles(root) {
+  const files = [];
+  if (fs8.existsSync(path9.join(root, BARE_FILE)))
+    files.push(BARE_FILE);
+  walk(root, DEVCONTAINER_DIR, files);
+  const sorted = files.sort();
+  const hasManifest = sorted.some((f2) => f2 === BARE_FILE || /(^|\/)devcontainer\.json$/.test(f2));
+  return hasManifest ? sorted : [];
+}
+function envHash(root, files) {
+  const h2 = createHash("sha256");
+  for (const rel of [...files].sort()) {
+    h2.update(rel, "utf8");
+    h2.update("\x00");
+    h2.update(fs8.readFileSync(path9.join(root, rel)));
+    h2.update("\x00");
+  }
+  return h2.digest("hex").slice(0, 16);
+}
+function human2(bytes) {
+  if (bytes >= 1024 * 1024)
+    return `${(bytes / 1024 / 1024).toFixed(2)} MiB`;
+  if (bytes >= 1024)
+    return `${Math.round(bytes / 1024)} KiB`;
+  return `${bytes} B`;
+}
+function buildEnvSpec(root) {
+  const files = devcontainerFiles(root);
+  if (!files.length)
+    return null;
+  const tmp = path9.join(os2.tmpdir(), `stepaway-envspec-${process.pid}-${Date.now()}.tgz`);
+  try {
+    const r2 = run("bash", ["-c", `set -e; exec tar czf ${shq(tmp)} ${files.map(shq).join(" ")}`], { cwd: root });
+    if (r2.code !== 0) {
+      throw new Error(`could not pack ${DEVCONTAINER_DIR}: ${r2.stderr.trim().split(`
+`).pop() || `tar exited ${r2.code}`}`);
+    }
+    const raw = fs8.readFileSync(tmp);
+    const filesTgz = raw.toString("base64");
+    if (filesTgz.length > ENVSPEC_MAX_BYTES) {
+      throw new Error(`devcontainer spec is too large to ship: ${human2(filesTgz.length)} of base64 tar.gz ` + `(limit ${human2(ENVSPEC_MAX_BYTES)}, ${files.length} file(s), ${human2(raw.length)} compressed). ` + `Keep build artifacts out of ${DEVCONTAINER_DIR}/, or set "image" in .stepaway.json to use a prebuilt image.`);
+    }
+    return { hash: envHash(root, files), filesTgz, files, bytes: raw.length };
+  } finally {
+    fs8.rmSync(tmp, { force: true });
+  }
+}
+function resolveRunnerEnv(root, image) {
+  const explicit = typeof image === "string" ? image.trim() : "";
+  if (explicit)
+    return { kind: "image", image: explicit };
+  const spec = buildEnvSpec(root);
+  if (spec)
+    return { kind: "devcontainer", spec };
+  return { kind: "generic" };
+}
+function previewRunnerEnv(root, image) {
+  const explicit = typeof image === "string" ? image.trim() : "";
+  if (explicit)
+    return describeRunnerEnv({ kind: "image", image: explicit });
+  const files = devcontainerFiles(root);
+  if (!files.length)
+    return describeRunnerEnv({ kind: "generic" });
+  return `devcontainer (hash ${envHash(root, files)}, built+cached on the runner)`;
+}
+function describeRunnerEnv(plan) {
+  if (plan.kind === "image")
+    return `image ${plan.image} (explicit)`;
+  if (plan.kind === "devcontainer") {
+    return `devcontainer (hash ${plan.spec.hash}, built+cached on the runner)`;
+  }
+  return "generic runner image";
+}
+
 // src/commands/push.ts
 var BIG_FILE_BYTES = 50 * 1024 * 1024;
 var LABEL_W = 18;
@@ -3533,6 +3641,7 @@ function consentSummary(m3, opts) {
     cont(`laptop containers are restarted right after capture`, k.dim);
   }
   row("setup", opts.setup ?? "(none detected)", k.ok);
+  row("environment", opts.environment, k.ok);
   row("agent", `runs autonomously on the runner: ${clip(opts.instruction, 80)}`, k.ok);
   L.push("");
   L.push(k.warn(k.bold("does NOT move")));
@@ -3595,11 +3704,16 @@ var createSession = async (x) => {
   const boot = x.ui.spinner(`creating session ${x.apiId.slice(0, 8)} on ${x.target}`);
   x.boot = boot;
   try {
-    x.session = await x.client.createSession({
+    const req = {
       sessionId: x.apiId,
-      project: path9.basename(x.root),
-      options: { remotePathBase: x.cfg.remotePathBase }
-    });
+      project: path10.basename(x.root),
+      options: {
+        remotePathBase: x.cfg.remotePathBase,
+        ...x.renv.kind === "image" ? { image: x.renv.image } : {}
+      },
+      ...x.renv.kind === "devcontainer" ? { envSpec: { hash: x.renv.spec.hash, filesTgz: x.renv.spec.filesTgz } } : {}
+    };
+    x.session = await x.client.createSession(req);
   } catch (e) {
     boot.fail(`could not create the session: ${e.message}`);
     return 1;
@@ -3608,7 +3722,7 @@ var createSession = async (x) => {
   return null;
 };
 var capture = async (x) => {
-  x.boot?.update(`runner ${x.session?.podName || x.apiId.slice(0, 8)} booting — capturing ${path9.basename(x.root)} meanwhile`);
+  x.boot?.update(`runner ${x.session?.podName || x.apiId.slice(0, 8)} booting — capturing ${path10.basename(x.root)} meanwhile`);
   try {
     await captureLocal(x.root, x.capDir, { sessionId: x.sid, excludes: x.excludes, composeFile: x.cfg.composeFile });
   } catch (e) {
@@ -3619,7 +3733,7 @@ var capture = async (x) => {
 };
 var carryEnv = async (x) => {
   const rawDeclared = readLines(x.capDir, "meta/declared-env-files.txt");
-  x.boot?.stop(`captured ${path9.basename(x.root)}; runner still booting`);
+  x.boot?.stop(`captured ${path10.basename(x.root)}; runner still booting`);
   x.boot = null;
   const { plan, asked, declared } = await resolveEnvPlan(rawDeclared, x.cfg.env, {
     interactive: !x.flags.yes,
@@ -3638,9 +3752,14 @@ var waitReadyAndCheckVars = async (x) => {
   const wait = x.ui.spinner("waiting for the runner (image pull + claude install)");
   try {
     const ready = await x.client.waitReady(x.apiId, {
-      onState: (s) => wait.update(`runner ${s.podName || x.apiId.slice(0, 8)}: ${s.state}`)
+      onState: (s) => wait.update(s.state === "building" ? "building devcontainer env image — first push with this config can take a few minutes" : `runner ${s.podName || x.apiId.slice(0, 8)}: ${s.state}`)
     });
     wait.stop(`runner ${ready.podName || x.apiId.slice(0, 8)} ready`);
+    if (x.renv.kind === "devcontainer" && ready.detail) {
+      x.ui.warn(`devcontainer env not used: ${ready.detail}`);
+      x.renv = { kind: "generic" };
+      x.environment = describeRunnerEnv(x.renv);
+    }
   } catch (e) {
     wait.fail(e.message);
     return x.fail("runner never became ready");
@@ -3678,6 +3797,7 @@ var consent = async (x) => {
     target: x.target,
     docker: x.dplan,
     setup: x.setupCmd,
+    environment: x.environment,
     instruction: x.instruction,
     color: x.ui.fancy,
     verbose: x.ui.verbose
@@ -3708,7 +3828,7 @@ var quiesceDocker = async (x) => {
 };
 var transfer = async (x) => {
   const xfer = x.ui.spinner(`transferring to ${x.target}`);
-  const tr = await bashAsync(`set -e; tar czf ${shq(x.tarPath)} -C ${shq(os2.tmpdir())} ${shq(x.capDirName)}`);
+  const tr = await bashAsync(`set -e; tar czf ${shq(x.tarPath)} -C ${shq(os3.tmpdir())} ${shq(x.capDirName)}`);
   if (tr.code !== 0) {
     xfer.fail(`tar failed: ${lastLine(tr.stderr)}`);
     return x.fail("tar failed");
@@ -3758,7 +3878,7 @@ var launch = async (x) => {
     remotePath: x.report?.workTree || x.remote
   });
   x.disarm();
-  x.ui.outro(`pushed — the cloud is now the source of truth for ${path9.basename(x.root)}
+  x.ui.outro(`pushed — the cloud is now the source of truth for ${path10.basename(x.root)}
 ` + `  watch:       stepaway peek -f
 ` + `  bring back:  stepaway pull
 ` + `  abandon:     stepaway destroy`);
@@ -3792,7 +3912,7 @@ async function cmdPush(args, flags) {
   const ui = Ui.from(flags);
   const dir = args[0] ?? process.cwd();
   const root = projectRoot(dir);
-  if (!fs8.existsSync(path9.join(root, ".git"))) {
+  if (!fs9.existsSync(path10.join(root, ".git"))) {
     ui.error(`not a git repository: ${root}`, "run stepaway push from inside a git project");
     return 1;
   }
@@ -3802,9 +3922,9 @@ async function cmdPush(args, flags) {
     return 1;
   }
   const client = opened.client;
-  ui.intro(`stepaway push  ${path9.basename(root)}`);
+  ui.intro(`stepaway push  ${path10.basename(root)}`);
   const cfg = resolveConfig(root, flags);
-  const home = os2.homedir();
+  const home = os3.homedir();
   const wanted = flags.session ? String(flags.session) : null;
   const sid = selectSession(home, root, wanted);
   if (wanted && !sid) {
@@ -3815,6 +3935,16 @@ async function cmdPush(args, flags) {
     ui.warn(`no Claude transcript for ${root}; carrying code only`);
   const capDirName = `stepaway-${Date.now()}`;
   const apiId = sid ?? randomUUID();
+  let renv;
+  try {
+    renv = resolveRunnerEnv(root, cfg.image);
+  } catch (e) {
+    ui.error(e.message);
+    return 1;
+  }
+  if (renv.kind === "devcontainer") {
+    ui.detail(`devcontainer env ${renv.spec.hash} from ${renv.spec.files.join(", ")}`);
+  }
   let armed = false;
   let disarmed = false;
   let why = "aborted";
@@ -3839,12 +3969,13 @@ async function cmdPush(args, flags) {
     excludes: excludePrefixes(cfg),
     sid,
     apiId,
+    renv,
     remote: remoteProjectPath(cfg, root),
     gitDir: remoteGitDir(root),
     target: client.server,
     capDirName,
-    capDir: path9.join(os2.tmpdir(), capDirName),
-    tarPath: path9.join(os2.tmpdir(), `${capDirName}.tar.gz`),
+    capDir: path10.join(os3.tmpdir(), capDirName),
+    tarPath: path10.join(os3.tmpdir(), `${capDirName}.tar.gz`),
     fail: (reason) => {
       why = reason;
       return 1;
@@ -3861,6 +3992,7 @@ async function cmdPush(args, flags) {
     unmet: [],
     dplan: null,
     setupCmd: null,
+    environment: describeRunnerEnv(renv),
     instruction: DEFAULT_INSTRUCTION,
     manifest: null,
     report: null
@@ -3885,15 +4017,15 @@ aborted — nothing was moved; the runner was deleted
   } finally {
     process.off("SIGINT", onSigint);
     await abandon();
-    fs8.rmSync(x.tarPath, { force: true });
-    fs8.rmSync(x.capDir, { recursive: true, force: true });
+    fs9.rmSync(x.tarPath, { force: true });
+    fs9.rmSync(x.capDir, { recursive: true, force: true });
   }
 }
 
 // src/commands/pull.ts
-import * as fs9 from "node:fs";
-import * as os3 from "node:os";
-import * as path10 from "node:path";
+import * as fs10 from "node:fs";
+import * as os4 from "node:os";
+import * as path11 from "node:path";
 
 // src/restore.ts
 function restoreLocal(captureDir, projectDir, branch, slug) {
@@ -3917,7 +4049,7 @@ async function cmdPull(args, flags) {
     return 1;
   }
   const client = opened.client;
-  ui.intro(`stepaway pull  ${path10.basename(root)}`);
+  ui.intro(`stepaway pull  ${path11.basename(root)}`);
   const localDirty = run("git", ["status", "--porcelain"], { cwd: root }).stdout.trim();
   if (localDirty && !flags.overwrite) {
     const n2 = localDirty.split(`
@@ -3944,37 +4076,37 @@ async function cmdPull(args, flags) {
   }
   const stamp = Date.now();
   const capDirName = `stepaway-pull-${stamp}`;
-  const localTar = path10.join(os3.tmpdir(), `${capDirName}.tar.gz`);
+  const localTar = path11.join(os4.tmpdir(), `${capDirName}.tar.gz`);
   const xfer = ui.spinner(`fetching the archive from ${client.server}`);
   let bytes = 0;
   try {
     bytes = await client.downloadArchive(sessionId, localTar);
   } catch (e) {
     xfer.fail(`archive download failed: ${e.message}`);
-    fs9.rmSync(localTar, { force: true });
+    fs10.rmSync(localTar, { force: true });
     return 1;
   }
-  const unpackRoot = path10.join(os3.tmpdir(), capDirName);
-  fs9.rmSync(unpackRoot, { recursive: true, force: true });
-  fs9.mkdirSync(unpackRoot, { recursive: true });
+  const unpackRoot = path11.join(os4.tmpdir(), capDirName);
+  fs10.rmSync(unpackRoot, { recursive: true, force: true });
+  fs10.mkdirSync(unpackRoot, { recursive: true });
   const un = await bashAsync(`set -e; tar xzf ${shq(localTar)} -C ${shq(unpackRoot)}`);
   if (un.code !== 0) {
     xfer.fail(`untar failed: ${lastLine(un.stderr)}`);
-    fs9.rmSync(localTar, { force: true });
-    fs9.rmSync(unpackRoot, { recursive: true, force: true });
+    fs10.rmSync(localTar, { force: true });
+    fs10.rmSync(unpackRoot, { recursive: true, force: true });
     return 1;
   }
   xfer.stop(`transferred home (${Math.max(1, Math.round(bytes / 1024))} KiB)`);
   const capDir = captureDirIn(unpackRoot);
   if (!capDir) {
     ui.error("the archive did not contain a capture directory", "the backend may have sent an empty archive");
-    fs9.rmSync(localTar, { force: true });
-    fs9.rmSync(unpackRoot, { recursive: true, force: true });
+    fs10.rmSync(localTar, { force: true });
+    fs10.rmSync(unpackRoot, { recursive: true, force: true });
     return 1;
   }
   const m3 = buildManifest(capDir);
   rewriteSessions(capDir, m3.captured.project_path, root);
-  const localSlug = existingSlugDir(os3.homedir(), root) ?? slugFor(root);
+  const localSlug = existingSlugDir(os4.homedir(), root) ?? slugFor(root);
   const rspin = ui.spinner("restoring locally");
   const rest = await restoreLocal(capDir, root, m3.captured.branch, localSlug);
   ui.detail(rest.stdout);
@@ -3984,8 +4116,8 @@ async function cmdPull(args, flags) {
   }
   rspin.stop(`restored ${m3.captured.branch} into ${root}`);
   const sid = capturedSessionId(m3) ?? baton?.sessionId ?? null;
-  fs9.rmSync(unpackRoot, { recursive: true, force: true });
-  fs9.rmSync(localTar, { force: true });
+  fs10.rmSync(unpackRoot, { recursive: true, force: true });
+  fs10.rmSync(localTar, { force: true });
   clearBaton(root);
   const dspin = ui.spinner(`deleting the runner and its PVC`);
   try {
@@ -4006,18 +4138,18 @@ async function cmdPull(args, flags) {
   return 0;
 }
 function captureDirIn(unpackRoot) {
-  if (fs9.existsSync(path10.join(unpackRoot, "meta")))
+  if (fs10.existsSync(path11.join(unpackRoot, "meta")))
     return unpackRoot;
-  for (const e of fs9.readdirSync(unpackRoot)) {
-    const p2 = path10.join(unpackRoot, e);
-    if (fs9.statSync(p2).isDirectory() && fs9.existsSync(path10.join(p2, "meta")))
+  for (const e of fs10.readdirSync(unpackRoot)) {
+    const p2 = path11.join(unpackRoot, e);
+    if (fs10.statSync(p2).isDirectory() && fs10.existsSync(path11.join(p2, "meta")))
       return p2;
   }
   return null;
 }
 
 // src/commands/status.ts
-import * as path11 from "node:path";
+import * as path12 from "node:path";
 function tintState(state, k) {
   if (state === "failed")
     return k.bad(k.bold(state));
@@ -4026,6 +4158,11 @@ function tintState(state, k) {
   if (state === "running")
     return k.cyan(k.bold(state));
   return k.warn(k.bold(state));
+}
+function stateNote(state) {
+  if (state === "building")
+    return " (building the devcontainer env image — first push with this env config)";
+  return "";
 }
 async function cmdStatus(args, flags) {
   const ui = Ui.from(flags);
@@ -4091,14 +4228,14 @@ no active handoff (push with: stepaway push)
 `);
     return err ? 1 : 0;
   }
-  ui.raw(`project:    ${root} (${path11.basename(root)})
+  ui.raw(`project:    ${root} (${path12.basename(root)})
 ` + `handed off: ${baton.pushedAt}
 ` + `backend:    ${baton.server}
 ` + `session:    ${baton.id}${baton.sessionId && baton.sessionId !== baton.id ? ` (transcript ${baton.sessionId})` : ""}
-` + `state:      ${s ? tintState(s.state, k) : k.bad("unknown")}` + (s?.exitCode !== undefined && s?.exitCode !== null ? ` (exit ${s.exitCode})` : "") + `
+` + `state:      ${s ? tintState(s.state, k) : k.bad("unknown")}` + stateNote(s?.state) + (s?.exitCode !== undefined && s?.exitCode !== null ? ` (exit ${s.exitCode})` : "") + `
 ` + (s?.detail ? `detail:     ${s.detail}
 ` : "") + (err ? `error:      ${err}
-` : "") + `pod:        ${s?.podName ?? "(unknown)"}
+` : "") + `pod:        ${s?.podName || (s?.state === "building" ? "(not created yet — env image building)" : "(unknown)")}
 ` + `work tree:  ${baton.remotePath}
 ` + `git dir:    ${remoteGitDir(root)} (on the session PVC)
 ` + `
@@ -4110,9 +4247,9 @@ watch:       stepaway peek -f
 }
 
 // src/commands/doctor.ts
-import * as fs10 from "node:fs";
-import * as os4 from "node:os";
-import * as path12 from "node:path";
+import * as fs11 from "node:fs";
+import * as os5 from "node:os";
+import * as path13 from "node:path";
 async function cmdDoctor(args, flags) {
   const ui = Ui.from(flags);
   const root = projectRoot(args[0] ?? process.cwd());
@@ -4125,12 +4262,12 @@ async function cmdDoctor(args, flags) {
   add("bash", which("bash"), which("bash") ? "present" : "not found on PATH");
   const major = Number(process.versions.node.split(".")[0]) || 0;
   add("node >= 20", major >= 20, `${process.version} (stepaway ${VERSION})`);
-  const isRepo = fs10.existsSync(path12.join(root, ".git"));
+  const isRepo = fs11.existsSync(path13.join(root, ".git"));
   add("git repo", isRepo, isRepo ? root : `${root} is not a git repository`);
-  const home = os4.homedir();
+  const home = os5.homedir();
   const slugDir = existingSlugDir(home, root);
   const sid = selectSession(home, root, flags.session ? String(flags.session) : null);
-  add("claude session", Boolean(sid), sid ? `${sid} (from ${path12.join(home, ".claude", "projects", slugDir ?? slugFor(root))})` : `no transcript at ~/.claude/projects/${slugFor(root)} (nothing to resume; code still moves)`, false);
+  add("claude session", Boolean(sid), sid ? `${sid} (from ${path13.join(home, ".claude", "projects", slugDir ?? slugFor(root))})` : `no transcript at ~/.claude/projects/${slugFor(root)} (nothing to resume; code still moves)`, false);
   const compose = findComposeFile(root, cfg.composeFile);
   const haveDocker = compose ? dockerAvailable() : false;
   add("docker carry", true, compose ? haveDocker ? `${compose} + local daemon reachable — services will be quiesced and carried` : `${compose} found but no reachable docker daemon; services will be skipped` : "no compose file; code + session handoff only", false);
@@ -4189,12 +4326,12 @@ ${k.dim("target:")} ${r2.server ?? "(no backend)"} → ${remoteProjectPath(cfg, 
 }
 
 // src/commands/init.ts
-import * as fs11 from "node:fs";
+import * as fs12 from "node:fs";
 async function cmdInit(args, flags) {
   const ui = Ui.from(flags);
   const root = projectRoot(args[0] ?? process.cwd());
   const p2 = configPath(root);
-  const existed = fs11.existsSync(p2);
+  const existed = fs12.existsSync(p2);
   const cfg = resolveConfig(root, flags);
   const patch = {
     remotePathBase: cfg.remotePathBase,
@@ -4207,8 +4344,11 @@ async function cmdInit(args, flags) {
     patch.composeFile = compose;
   if (cfg.setup !== null)
     patch.setup = cfg.setup;
+  if (cfg.image)
+    patch.image = cfg.image;
   patchConfig(root, patch);
   const setup = cfg.setup ?? detectSetup(root);
+  const env2 = previewRunnerEnv(root, cfg.image);
   const global = readClientConfig();
   if (flags.json) {
     ui.raw(JSON.stringify({ path: p2, updated: existed, config: loadConfig(root) }, null, 2) + `
@@ -4219,6 +4359,9 @@ async function cmdInit(args, flags) {
 ` + `  remote working tree: ${remoteProjectPath(cfg, root)} (one pod per session)
 ` + `  compose file: ${compose ?? "(none)"}
 ` + `  setup: ${setup ?? "(none detected)"}
+` + `  runner environment: ${env2}
+` + `    set "image": "<ref>" in ${p2} to pin an explicit runner image;
+` + `    otherwise a .devcontainer/devcontainer.json is built and cached on the cluster.
 ` + `next: stepaway auth, then stepaway doctor
 `);
   }
@@ -4226,23 +4369,23 @@ async function cmdInit(args, flags) {
 }
 
 // src/commands/skill.ts
-import * as fs13 from "node:fs";
-import * as os5 from "node:os";
-import * as path14 from "node:path";
+import * as fs14 from "node:fs";
+import * as os6 from "node:os";
+import * as path15 from "node:path";
 
 // src/pkg.ts
-import * as fs12 from "node:fs";
-import * as path13 from "node:path";
+import * as fs13 from "node:fs";
+import * as path14 from "node:path";
 import { fileURLToPath } from "node:url";
 function packageFile(rel) {
-  const here = path13.dirname(fileURLToPath(import.meta.url));
+  const here = path14.dirname(fileURLToPath(import.meta.url));
   const cands = [
-    path13.join(here, "..", rel),
-    path13.join(here, "..", "..", rel),
-    path13.join(process.cwd(), rel)
+    path14.join(here, "..", rel),
+    path14.join(here, "..", "..", rel),
+    path14.join(process.cwd(), rel)
   ];
   for (const c3 of cands)
-    if (fs12.existsSync(c3))
+    if (fs13.existsSync(c3))
       return c3;
   throw new Error(`packaged file not found: ${rel} (looked in ${cands.join(", ")})`);
 }
@@ -4256,11 +4399,11 @@ usage: stepaway skill install
 `);
     return 1;
   }
-  const src = packageFile(path14.join("skill", "stepaway"));
-  const dst = path14.join(os5.homedir(), ".claude", "skills", "stepaway");
-  fs13.mkdirSync(path14.dirname(dst), { recursive: true });
-  fs13.rmSync(dst, { recursive: true, force: true });
-  fs13.cpSync(src, dst, { recursive: true });
+  const src = packageFile(path15.join("skill", "stepaway"));
+  const dst = path15.join(os6.homedir(), ".claude", "skills", "stepaway");
+  fs14.mkdirSync(path15.dirname(dst), { recursive: true });
+  fs14.rmSync(dst, { recursive: true, force: true });
+  fs14.cpSync(src, dst, { recursive: true });
   if (flags.json)
     process.stdout.write(JSON.stringify({ installed: dst }, null, 2) + `
 `);
@@ -4752,17 +4895,17 @@ ${HELP}`);
 `);
         return 2;
       }
-      const root = path15.resolve(dir);
+      const root = path16.resolve(dir);
       const cfg = loadConfig(root);
-      const sid = p2.flags.session ? String(p2.flags.session) : selectSession(os6.homedir(), root, null);
-      await captureLocal(root, path15.resolve(out), {
+      const sid = p2.flags.session ? String(p2.flags.session) : selectSession(os7.homedir(), root, null);
+      await captureLocal(root, path16.resolve(out), {
         sessionId: sid,
         excludes: excludePrefixes(cfg),
         composeFile: cfg.composeFile
       });
-      const m3 = buildManifest(path15.resolve(out));
+      const m3 = buildManifest(path16.resolve(out));
       if (target)
-        rewriteSessions(path15.resolve(out), m3.captured.project_path, target);
+        rewriteSessions(path16.resolve(out), m3.captured.project_path, target);
       process.stdout.write(JSON.stringify(m3, null, 2) + `
 `);
       return 0;

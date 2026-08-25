@@ -11,6 +11,12 @@ function tintState(state: string, k: ReturnType<typeof colorize>): string {
   return k.warn(k.bold(state));
 }
 
+/** Only the states whose name does not explain itself get a gloss. */
+function stateNote(state: string | undefined): string {
+  if (state === "building") return " (building the devcontainer env image — first push with this env config)";
+  return "";
+}
+
 export async function cmdStatus(args: string[], flags: Record<string, any>): Promise<number> {
   const ui = Ui.from(flags);
   const root = projectRoot(args[0] ?? process.cwd());
@@ -86,11 +92,12 @@ export async function cmdStatus(args: string[], flags: Record<string, any>): Pro
       `backend:    ${baton.server}\n` +
       `session:    ${baton.id}${baton.sessionId && baton.sessionId !== baton.id ? ` (transcript ${baton.sessionId})` : ""}\n` +
       `state:      ${s ? tintState(s.state, k) : k.bad("unknown")}` +
+      stateNote(s?.state) +
       (s?.exitCode !== undefined && s?.exitCode !== null ? ` (exit ${s.exitCode})` : "") +
       `\n` +
       (s?.detail ? `detail:     ${s.detail}\n` : "") +
       (err ? `error:      ${err}\n` : "") +
-      `pod:        ${s?.podName ?? "(unknown)"}\n` +
+      `pod:        ${s?.podName || (s?.state === "building" ? "(not created yet — env image building)" : "(unknown)")}\n` +
       `work tree:  ${baton.remotePath}\n` +
       `git dir:    ${remoteGitDir(root)} (on the session PVC)\n` +
       `\nwatch:       stepaway peek -f\n` +

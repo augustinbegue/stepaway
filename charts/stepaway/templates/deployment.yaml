@@ -62,6 +62,32 @@ spec:
               value: {{ .Values.runner.pvc.size | quote }}
             - name: RUNNER_DIND_ENABLED
               value: {{ .Values.runner.dind.enabled | quote }}
+            {{- if .Values.registry.enabled }}
+            {{- /* Devcontainer env-image path (SPEC-v0.3). Names are frozen and
+                   shared with the backend; an unset REGISTRY_HOST means the
+                   feature is off, so nothing here is rendered when the registry
+                   component is disabled. */}}
+            - name: REGISTRY_HOST
+              value: {{ required "registry.host is REQUIRED when registry.enabled=true (see values.yaml)." .Values.registry.host | quote }}
+            - name: REGISTRY_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.registry.auth.secretName }}
+                  key: username
+            - name: REGISTRY_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.registry.auth.secretName }}
+                  key: password
+            - name: REGISTRY_PULL_SECRET
+              value: {{ .Values.registry.pullSecretName | quote }}
+            {{- /* Name of the creds Secret the backend mounts into build Jobs
+                   (secretKeyRef, never inline env) — must track auth.secretName. */}}
+            - name: REGISTRY_AUTH_SECRET
+              value: {{ .Values.registry.auth.secretName | quote }}
+            - name: BUILDER_IMAGE
+              value: {{ .Values.builder.image | quote }}
+            {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

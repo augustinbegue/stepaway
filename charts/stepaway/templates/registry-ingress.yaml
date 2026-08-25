@@ -1,0 +1,42 @@
+{{- if and .Values.registry.enabled .Values.registry.expose.enabled }}
+{{- $host := required "registry.host is REQUIRED when registry.enabled=true (see values.yaml)." .Values.registry.host -}}
+{{- /* Rendered here rather than by the subchart so the host comes from
+       registry.host only. The subchart's Service is <release>-registry:5000
+       (the dependency is aliased to `registry`). */ -}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "stepaway.fullname" . }}-registry
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "stepaway.labels" . | nindent 4 }}
+  annotations:
+    # Image layers are big; ingress controllers that default to a small body
+    # limit will break pushes. nginx's knob is set here as a courtesy and can
+    # be overridden/removed via registry.expose.annotations.
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"
+    {{- with .Values.registry.expose.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  {{- with .Values.registry.expose.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- with .Values.registry.expose.tls.secretName }}
+  tls:
+    - hosts:
+        - {{ $host | quote }}
+      secretName: {{ . }}
+  {{- end }}
+  rules:
+    - host: {{ $host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "stepaway.registryFullname" . }}
+                port:
+                  number: {{ .Values.registry.service.port | default 5000 }}
+{{- end }}

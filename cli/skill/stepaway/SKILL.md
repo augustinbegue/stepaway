@@ -52,7 +52,9 @@ and stop there. There is no kubectl on this machine and none is needed.
      values), **which containers will be stopped** and which volumes travel, the
      setup command, and that the agent will run autonomously;
    - what does NOT: gitignored files, skipped env files, orphan containers, and
-     that docker volumes never come back.
+     that docker volumes never come back;
+   - the `environment:` line — the runner image, a devcontainer that will be
+     built and cached on the cluster, or the generic image.
 
    `--yes` also means the CLI does not run the interactive env picker: it carries
    every declared env file unless `.stepaway.json` says otherwise. **List those
@@ -67,6 +69,10 @@ and stop there. There is no kubectl on this machine and none is needed.
    for this project.
 
 Notes:
+- If the project has no `.devcontainer/devcontainer.json`, authoring one is a
+  valuable first commit: it becomes the runner's environment on the next push
+  (built once on the cluster, cached by content hash after that), and the first
+  push with a new one sits in state `building` for a few minutes.
 - Env values are never printed by the CLI. Do not go read `.env` yourself to
   "check" — that would put secrets in this transcript.
 - Pushing stops the project's containers briefly and restarts them. Say so before
@@ -103,7 +109,8 @@ stepaway pull
 ## Status and cleanup
 
 `stepaway status` (add `--json` to parse it) says whether this project is handed
-off, to which backend and session id, and the run **state** — one of `pending`,
+off, to which backend and session id, and the run **state** — one of `building`
+(devcontainer env image being built, before the pod exists), `pending`,
 `restoring`, `ready`, `running`, `done`, `failed`. Lead with that state when the
 user asks how it is going: `done` means the run finished, `failed` means it did
 not, and `stepaway peek` says why. With no handoff it lists every session the

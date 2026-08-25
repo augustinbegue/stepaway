@@ -31,6 +31,24 @@ export type PodObject = {
   };
 };
 
+/**
+ * A PVC, read back. Only the metadata matters: before a session's pod exists
+ * (state `building`) the PVC is where the session's annotations live, so it is
+ * shaped exactly like a pod's metadata on purpose.
+ */
+export type PvcObject = { metadata: PodObject["metadata"] };
+
+/** batch/v1 Job (the devcontainer env builds, SPEC-v0.3 "Build path"). */
+export type JobObject = {
+  metadata: PodObject["metadata"];
+  status?: {
+    active?: number;
+    succeeded?: number;
+    failed?: number;
+    conditions?: { type: string; status: string; reason?: string; message?: string }[];
+  };
+};
+
 export type ExecResult = { code: number; stdout: string; stderr: string };
 
 export type ExecOpts = {
@@ -53,9 +71,21 @@ export interface K8s {
   patchPodAnnotations(name: string, annotations: Record<string, string | null>): Promise<void>;
   deletePod(name: string): Promise<void>;
   deletePvc(name: string): Promise<void>;
+  getPvc(name: string): Promise<PvcObject | null>;
+  listPvcs(labelSelector?: string): Promise<PvcObject[]>;
+  /** strategic-merge patch of PVC annotations (null value deletes a key). */
+  patchPvcAnnotations(name: string, annotations: Record<string, string | null>): Promise<void>;
   getSecret(name: string): Promise<Record<string, string> | null>;
   /** create-or-replace an Opaque Secret from already-base64 data. */
   applySecret(name: string, data: Record<string, string>): Promise<void>;
+  deleteSecret(name: string): Promise<void>;
+  /** apply a batch/v1 Job (YAML). Already-exists is not an error. */
+  createJobFromYaml(yaml: string): Promise<void>;
+  getJob(name: string): Promise<JobObject | null>;
+  listJobs(labelSelector?: string): Promise<JobObject[]>;
+  deleteJob(name: string): Promise<void>;
+  /** tail of a pod's logs; "" when the pod or its logs are gone. */
+  podLogs(name: string, opts?: { container?: string; tailLines?: number }): Promise<string>;
   listStorageClasses(): Promise<StorageClassProbe>;
   /** SelfSubjectAccessReview; false when the review itself is refused. */
   canI(verb: string, resource: string, subresource?: string): Promise<boolean>;
@@ -198,6 +228,70 @@ export class RestK8s implements K8s {
     if (r.status !== 404 && r.status >= 400) throw new ApiError(r.status, r.text);
   }
 
+  async getPvc(name: string): Promise<PvcObject | null> {
+    const r = await this.req(this.ns(`persistentvolumeclaims/${encodeURIComponent(name)}`));
+    if (r.status === 404) return null;
+    if (r.status >= 400) throw new ApiError(r.status, r.text);
+    return JSON.parse(r.text) as PvcObject;
+  }
+
+  async listPvcs(labelSelector?: string): Promise<PvcObject[]> {
+    const q = labelSelector ? `?labelSelector=${encodeURIComponent(labelSelector)}` : "";
+    const list = await this.json<{ items: PvcObject[] }>(this.ns(`persistentvolumeclaims${q}`));
+    return list.items ?? [];
+  }
+
+  async patchPvcAnnotations(name: string, annotations: Record<string, string | null>): Promise<void> {
+    const r = await this.req(this.ns(`persistentvolumeclaims/${encodeURIComponent(name)}`), {
+      method: "PATCH",
+      contentType: "application/merge-patch+json",
+      body: JSON.stringify({ metadata: { annotations } }),
+    });
+    if (r.status === 404) return;
+    if (r.status >= 400) throw new ApiError(r.status, r.text);
+  }
+
+  private batch(sub: string): string {
+    return `/apis/batch/v1/namespaces/${encodeURIComponent(this.namespace)}/${sub}`;
+  }
+
+  async createJobFromYaml(yaml: string): Promise<void> {
+    const r = await this.req(this.batch("jobs"), { method: "POST", body: yaml, contentType: "application/yaml" });
+    if (r.status === 409) return; // another session with the same env hash won
+    if (r.status >= 400) throw new ApiError(r.status, r.text);
+  }
+
+  async getJob(name: string): Promise<JobObject | null> {
+    const r = await this.req(this.batch(`jobs/${encodeURIComponent(name)}`));
+    if (r.status === 404) return null;
+    if (r.status >= 400) throw new ApiError(r.status, r.text);
+    return JSON.parse(r.text) as JobObject;
+  }
+
+  async listJobs(labelSelector?: string): Promise<JobObject[]> {
+    const q = labelSelector ? `?labelSelector=${encodeURIComponent(labelSelector)}` : "";
+    const list = await this.json<{ items: JobObject[] }>(this.batch(`jobs${q}`));
+    return list.items ?? [];
+  }
+
+  async deleteJob(name: string): Promise<void> {
+    // Background propagation, otherwise the Job's pod outlives it.
+    const r = await this.req(this.batch(`jobs/${encodeURIComponent(name)}?propagationPolicy=Background`), {
+      method: "DELETE",
+    });
+    if (r.status !== 404 && r.status >= 400) throw new ApiError(r.status, r.text);
+  }
+
+  async podLogs(name: string, opts: { container?: string; tailLines?: number } = {}): Promise<string> {
+    const q = new URLSearchParams();
+    if (opts.container) q.set("container", opts.container);
+    if (opts.tailLines) q.set("tailLines", String(opts.tailLines));
+    const r = await this.req(this.ns(`pods/${encodeURIComponent(name)}/log?${q}`), { accept: "text/plain" });
+    // Logs are diagnostics: a pod that already vanished must not throw.
+    if (r.status >= 400) return "";
+    return r.text;
+  }
+
   async getSecret(name: string): Promise<Record<string, string> | null> {
     const r = await this.req(this.ns(`secrets/${encodeURIComponent(name)}`));
     if (r.status === 404) return null;
@@ -222,6 +316,11 @@ export class RestK8s implements K8s {
       contentType: "application/json",
     });
     if (put.status >= 400) throw new ApiError(put.status, put.text);
+  }
+
+  async deleteSecret(name: string): Promise<void> {
+    const r = await this.req(this.ns(`secrets/${encodeURIComponent(name)}`), { method: "DELETE" });
+    if (r.status !== 404 && r.status >= 400) throw new ApiError(r.status, r.text);
   }
 
   async listStorageClasses(): Promise<StorageClassProbe> {

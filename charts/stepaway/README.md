@@ -38,9 +38,11 @@ values/release history in plaintext. Prefer the generated token.
 The backend's ServiceAccount is bound to a **namespace-scoped Role only**
 (no ClusterRole): `pods` (get/list/watch/create/delete/patch), `pods/exec`
 (create), `pods/log` (get), `persistentvolumeclaims`
-(get/list/create/delete), `secrets` (get/create/patch — used for the
-per-session `stepaway-auth` env-carry secret), `events` (create/patch).
-Sessions always live in the release namespace, next to the backend.
+(get/list/create/delete), `secrets` (get/create/patch/delete — used for the
+per-session `stepaway-auth` env-carry secret and the per-build envspec
+secrets), `batch/jobs` (get/list/watch/create/delete — devcontainer env-image
+builds), `events` (create/patch). Sessions always live in the release
+namespace, next to the backend.
 
 ## Governance (opt-in, all disabled by default)
 
@@ -64,6 +66,57 @@ NetworkPolicy. Turn these on per-cluster as needed:
   will accept these objects but silently not enforce them. Verify
   enforcement (e.g. with a quick pod-to-pod test) before relying on this for
   session isolation.
+
+## Devcontainer environments (registry component, opt-in)
+
+With `registry.enabled=true` the chart adds an in-cluster OCI registry (the
+`docker-registry` subchart from twuni, aliased to `registry`) and turns on the
+devcontainer path: a session whose repo carries a `.devcontainer/` runs in an
+image built from it (plus the
+[stepaway feature](https://github.com/augustinbegue/stepaway/tree/main/feature)),
+cached as `<registry.host>/stepaway-env:env-<hash>`. On a cache miss the
+backend runs a `Job` from `builder.image` and the session waits in state
+`building`.
+
+```console
+helm upgrade --install stepaway stepaway/stepaway -n stepaway \
+  --set registry.enabled=true \
+  --set registry.host=registry.example.com \
+  --set registry.expose.className=nginx \
+  --set registry.expose.tls.secretName=registry-example-com-tls \
+  --set registry.persistence.size=50Gi
+```
+
+**`registry.host` is required and must be a name your *nodes* can resolve.**
+The env image is pulled by the kubelet, not by a pod: kubelets run on the node
+host, outside the pod network and outside cluster DNS, so
+`<release>-registry.<ns>.svc.cluster.local:5000` is unusable for them. Give the
+registry a real DNS name pointed at your ingress controller with a valid TLS
+certificate (docker refuses plain-HTTP registries unless every node is
+configured to allow it).
+
+Notes:
+
+- The chart mints user `stepaway` + a random password into Secret
+  `registry.auth.secretName` (`username` / `password` / `htpasswd` keys),
+  preserved across upgrades like the bearer token, and derives the
+  dockerconfigjson Secret `registry.pullSecretName` that session pods use as an
+  `imagePullSecret`. Backend env wired from it: `REGISTRY_HOST`,
+  `REGISTRY_USER`, `REGISTRY_PASS`, `REGISTRY_PULL_SECRET`, `BUILDER_IMAGE`.
+  With `registry.enabled=false` none of these are set, which is how the backend
+  knows the devcontainer path is off.
+- The Ingress for `registry.host` is rendered by *this* chart (the subchart's
+  own `ingress.enabled` stays `false`) so the host lives in exactly one value.
+  Set `registry.expose.*` for class/annotations/TLS.
+- Everything else under `registry.*` is the subchart's values surface
+  (`persistence`, `resources`, `nodeSelector`, ...); see
+  [twuni/docker-registry.helm](https://github.com/twuni/docker-registry.helm).
+  Its auth values (`secrets.htpasswd`) are deliberately left empty — auth is
+  mounted from the chart-generated Secret via `registry.extraVolumes`, so if
+  you change `registry.auth.secretName` you must change that reference too
+  (the chart fails the render if they diverge).
+- Garbage collection is a manual op (see `NOTES.txt` for the exact
+  `kubectl exec ... registry garbage-collect` line).
 
 ## Values
 
@@ -106,5 +159,19 @@ NetworkPolicy. Turn these on per-cluster as needed:
 | `limitRange.max.*` | `4` / `8Gi` | Max container request/limit. |
 | `networkPolicy.enabled` | `false` | Enable the runner + backend NetworkPolicies. |
 | `networkPolicy.runnerEgress` | `[]` | Egress rules for runner pods (verbatim `spec.egress`). |
+| `builder.image` | `ghcr.io/augustinbegue/stepaway-builder:latest` | Image of the env-image build Job (`BUILDER_IMAGE`). Only used when `registry.enabled`. |
+| `registry.enabled` | `false` | Deploy the in-cluster registry and enable the devcontainer env path. |
+| `registry.host` | `""` | **Required when enabled.** Node-resolvable DNS name of the registry, `host[:port]`, no scheme. |
+| `registry.expose.enabled` | `true` | Render an Ingress for `registry.host`. |
+| `registry.expose.className` | `""` | IngressClass for the registry Ingress. |
+| `registry.expose.annotations` | `{}` | Extra annotations (a `proxy-body-size: 0` nginx annotation is always set). |
+| `registry.expose.tls.secretName` | `""` | TLS Secret for `registry.host`; empty = no TLS (pushes/pulls will fail). |
+| `registry.auth.secretName` | `stepaway-registry-auth` | Secret holding `username`/`password`/`htpasswd`. |
+| `registry.auth.regeneratePassword` | `false` | Force a new registry password on next upgrade. |
+| `registry.pullSecretName` | `stepaway-registry-pull` | dockerconfigjson Secret used as `imagePullSecret` on session pods (`REGISTRY_PULL_SECRET`). |
+| `registry.persistence.enabled` | `true` | PVC-back the registry (subchart value). |
+| `registry.persistence.size` | `20Gi` | Registry PVC size. |
+| `registry.persistence.storageClass` | `""` | Registry PVC StorageClass (empty = cluster default). |
+| `registry.*` | subchart defaults | Any other [twuni/docker-registry](https://github.com/twuni/docker-registry.helm) value. |
 
 See `values.yaml` for the fully commented source of truth.

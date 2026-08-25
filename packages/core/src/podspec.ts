@@ -40,6 +40,12 @@ export type RunnerOverrides = {
    * container and its storage volume (clusters that refuse privileged pods).
    */
   dindEnabled?: boolean;
+  /**
+   * v0.3: names of dockerconfigjson Secrets the kubelet uses to pull `image`.
+   * Only set for env images that live in the cluster registry — the default
+   * public image needs none, so an empty/absent list renders nothing.
+   */
+  imagePullSecrets?: string[];
   /** extra pod annotations (the backend stores session state in these). */
   annotations?: Record<string, string>;
 };
@@ -111,6 +117,10 @@ export function podManifest(o: PodOpts): string {
       emptyDir: {}
 `
     : "";
+  const pullSecrets = (o.imagePullSecrets ?? []).filter(Boolean);
+  const pullSecretsBlock = pullSecrets.length
+    ? `  imagePullSecrets:\n` + pullSecrets.map((n) => `    - name: ${n}`).join("\n") + "\n"
+    : "";
   return `apiVersion: v1
 kind: Pod
 metadata:
@@ -120,7 +130,7 @@ metadata:
     ${SESSION_LABEL}: ${o.sessionId}
 ${annotationsBlock(o.annotations, "  ")}spec:
   restartPolicy: Always
-  containers:
+${pullSecretsBlock}  containers:
     - name: runner
       image: ${o.image ?? "node:22-bookworm-slim"}
       command: ["bash", "-lc"]

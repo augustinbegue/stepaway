@@ -8,7 +8,7 @@
  * still pending gets re-probed the next time anyone reads it.
  */
 
-import { createApp } from "./app.js";
+import { advanceBuild, createApp, type AppDeps, type BuildWatch } from "./app.js";
 import { loadConfig, VERSION } from "./config.js";
 import { RestK8s, type K8s } from "./k8s.js";
 import { bashLine } from "./sh.js";
@@ -48,13 +48,56 @@ export function pollUntilReady(k8s: K8s, podName: string): void {
   })();
 }
 
+const BUILD_POLL_MS = 5_000;
+/** activeDeadlineSeconds is 1200; give the watcher room to see the verdict. */
+const BUILD_TIMEOUT_MS = 30 * 60_000;
+
+/**
+ * Watch a devcontainer build to its verdict (SPEC-v0.3). Same shape as the
+ * ready poll above, and just as disposable: advanceBuild() is idempotent and
+ * reads everything it needs from the cluster, so a backend restart only costs
+ * the session the delay until someone calls advanceBuild again.
+ */
+export function pollBuild(deps: AppDeps, watch: BuildWatch): void {
+  const deadline = Date.now() + BUILD_TIMEOUT_MS;
+  void (async () => {
+    for (;;) {
+      await new Promise((r) => setTimeout(r, BUILD_POLL_MS));
+      try {
+        const state = await advanceBuild(deps, watch);
+        if (state !== "building") return;
+      } catch (e) {
+        console.warn(`stepaway: build watch ${watch.hash} failed a step: ${(e as Error).message}`);
+      }
+      if (Date.now() > deadline) {
+        await deps.k8s
+          .patchPvcAnnotations(watch.name, {
+            [ANN.state]: "failed",
+            [ANN.detail]: `the env build did not finish within ${Math.round(BUILD_TIMEOUT_MS / 60_000)}m`,
+          })
+          .catch(() => undefined);
+        return;
+      }
+    }
+  })();
+}
+
 async function main(): Promise<void> {
   const config = loadConfig();
   if (!config.token) {
     console.error("STEPAWAY_TOKEN is not set — every authenticated route will answer 503");
   }
   const k8s = await RestK8s.create({ namespace: config.namespace });
-  const app = createApp({ k8s, config, onSessionCreated: (pod) => pollUntilReady(k8s, pod) });
+  const deps: AppDeps = {
+    k8s,
+    config,
+    onSessionCreated: (pod) => pollUntilReady(k8s, pod),
+    onBuildStarted: (watch) => pollBuild(deps, watch),
+  };
+  const app = createApp(deps);
+  if (config.registry.host) {
+    console.log(`stepaway: devcontainer builds enabled — registry ${config.registry.host}`);
+  }
   console.log(`stepaway backend ${VERSION} — namespace ${k8s.namespace}, port ${config.port}`);
   Bun.serve({ port: config.port, hostname: "0.0.0.0", fetch: app.fetch, idleTimeout: 0 });
 }

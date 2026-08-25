@@ -9,7 +9,32 @@ import type { RunnerOverrides } from "@stepaway/core";
  * Kept as a literal so the bundled single-file image has no filesystem lookup;
  * server/test/version.test.ts fails the build if it drifts from package.json.
  */
-export const VERSION = "0.3.1";
+export const VERSION = "0.4.0";
+
+/**
+ * SPEC-v0.3 "Registry component": the four names below are frozen and set by
+ * the chart. `host` empty = the devcontainer path is disabled altogether
+ * (session create falls through to the generic image with a warning).
+ *
+ * These are *server* env vars, not runner-pod ones, so they deliberately do
+ * NOT join RUNNER_ENV_NAMES — that list stays the RUNNER_* drift contract.
+ */
+export type RegistryConfig = {
+  /** node-reachable registry host, e.g. registry.stepaway.dev (no scheme). */
+  host: string;
+  /** basic-auth creds for the server's own manifest (cache) checks. */
+  user: string;
+  pass: string;
+  /** image that runs `devcontainer build` inside the build Job. */
+  builderImage: string;
+  /** dockerconfigjson Secret the session pod pulls env images with. */
+  pullSecret: string;
+  /**
+   * Secret the build Job reads its push credentials from (keys `username` /
+   * `password`), so registry creds never appear inline in a Job manifest.
+   */
+  authSecret: string;
+};
 
 export type ServerConfig = {
   port: number;
@@ -18,7 +43,12 @@ export type ServerConfig = {
   /** bearer token every route but /v1/healthz requires. */
   token: string;
   runner: RunnerOverrides;
+  registry: RegistryConfig;
 };
+
+export const DEFAULT_BUILDER_IMAGE = "ghcr.io/augustinbegue/stepaway-builder:latest";
+export const DEFAULT_PULL_SECRET = "stepaway-registry-pull";
+export const DEFAULT_REGISTRY_AUTH_SECRET = "stepaway-registry-auth";
 
 /**
  * Every RUNNER_* variable this server reads. The chart's deployment.yaml must
@@ -54,6 +84,14 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       storageClass: env.RUNNER_STORAGE_CLASS || undefined,
       storageSize: env.RUNNER_STORAGE_SIZE || undefined,
       dindEnabled: boolEnv(env.RUNNER_DIND_ENABLED),
+    },
+    registry: {
+      host: (env.REGISTRY_HOST ?? "").trim().replace(/^https?:\/\//, "").replace(/\/+$/, ""),
+      user: env.REGISTRY_USER ?? "",
+      pass: env.REGISTRY_PASS ?? "",
+      builderImage: env.BUILDER_IMAGE || DEFAULT_BUILDER_IMAGE,
+      pullSecret: env.REGISTRY_PULL_SECRET || DEFAULT_PULL_SECRET,
+      authSecret: env.REGISTRY_AUTH_SECRET || DEFAULT_REGISTRY_AUTH_SECRET,
     },
   };
 }

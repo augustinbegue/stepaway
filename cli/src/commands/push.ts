@@ -13,6 +13,7 @@ import {
   remoteProjectPath,
   unsatisfiedVars,
   type CaptureReport,
+  type CreateSessionRequest,
   type DockerManifest,
   type Manifest,
   type ManifestExtras,
@@ -31,6 +32,7 @@ import { buildManifest, captureLocal, readLines, rewriteSessions, selectSession 
 import { carryEnvFiles, resolveEnvPlan, type EnvCarryResult } from "../envcarry.js";
 import { captureDocker, human, planDocker, type DockerPlan } from "../docker.js";
 import { resolveSetup } from "../setup.js";
+import { describeRunnerEnv, resolveRunnerEnv, type RunnerEnv } from "../envspec.js";
 
 /** Only mention a specific dirty file inline when its size is a surprise. */
 const BIG_FILE_BYTES = 50 * 1024 * 1024;
@@ -53,6 +55,8 @@ export function consentSummary(
     target: string;
     docker: DockerPlan | null;
     setup: string | null;
+    /** the resolved `environment:` line (SPEC-v0.3 env resolution order). */
+    environment: string;
     instruction: string;
     color?: boolean;
     verbose?: boolean;
@@ -102,6 +106,7 @@ export function consentSummary(
     cont(`laptop containers are restarted right after capture`, k.dim);
   }
   row("setup", opts.setup ?? "(none detected)", k.ok);
+  row("environment", opts.environment, k.ok);
   row("agent", `runs autonomously on the runner: ${clip(opts.instruction, 80)}`, k.ok);
   L.push("");
 
@@ -162,6 +167,8 @@ type PushCtx = {
   sid: string | null;
   /** the API session id: the transcript id, or a fresh uuid. */
   apiId: string;
+  /** what the runner's environment will be (resolved before anything boots). */
+  renv: RunnerEnv;
   remote: string;
   gitDir: string;
   target: string;
@@ -182,6 +189,8 @@ type PushCtx = {
   unmet: string[];
   dplan: DockerPlan | null;
   setupCmd: string | null;
+  /** consent-summary rendering of `renv`. */
+  environment: string;
   instruction: string;
   manifest: Manifest | null;
   report: CaptureReport | null;
@@ -243,11 +252,20 @@ const createSession: Phase = async (x) => {
   const boot = x.ui.spinner(`creating session ${x.apiId.slice(0, 8)} on ${x.target}`);
   x.boot = boot;
   try {
-    x.session = await x.client.createSession({
+    const req: CreateSessionRequest = {
       sessionId: x.apiId,
       project: path.basename(x.root),
-      options: { remotePathBase: x.cfg.remotePathBase },
-    });
+      options: {
+        remotePathBase: x.cfg.remotePathBase,
+        ...(x.renv.kind === "image" ? { image: x.renv.image } : {}),
+      },
+      // shipped at create so the env build overlaps capture, exactly as pod
+      // boot already does (SPEC-v0.3 "Build path")
+      ...(x.renv.kind === "devcontainer"
+        ? { envSpec: { hash: x.renv.spec.hash, filesTgz: x.renv.spec.filesTgz } }
+        : {}),
+    };
+    x.session = await x.client.createSession(req);
   } catch (e) {
     boot.fail(`could not create the session: ${(e as Error).message}`);
     // nothing exists on the backend yet: the finalizer is still unarmed
@@ -303,9 +321,21 @@ const waitReadyAndCheckVars: Phase = async (x) => {
   const wait = x.ui.spinner("waiting for the runner (image pull + claude install)");
   try {
     const ready = await x.client.waitReady(x.apiId, {
-      onState: (s) => wait.update(`runner ${s.podName || x.apiId.slice(0, 8)}: ${s.state}`),
+      onState: (s) =>
+        wait.update(
+          s.state === "building"
+            ? "building devcontainer env image — first push with this config can take a few minutes"
+            : `runner ${s.podName || x.apiId.slice(0, 8)}: ${s.state}`,
+        ),
     });
     wait.stop(`runner ${ready.podName || x.apiId.slice(0, 8)} ready`);
+    // the backend tells us here when it could not honour the devcontainer
+    // (no registry configured) and fell through to the generic image
+    if (x.renv.kind === "devcontainer" && ready.detail) {
+      x.ui.warn(`devcontainer env not used: ${ready.detail}`);
+      x.renv = { kind: "generic" };
+      x.environment = describeRunnerEnv(x.renv);
+    }
   } catch (e) {
     wait.fail((e as Error).message);
     return x.fail("runner never became ready");
@@ -351,6 +381,7 @@ const consent: Phase = async (x) => {
     target: x.target,
     docker: x.dplan,
     setup: x.setupCmd,
+    environment: x.environment,
     instruction: x.instruction,
     color: x.ui.fancy,
     verbose: x.ui.verbose,
@@ -520,6 +551,19 @@ export async function cmdPush(args: string[], flags: Record<string, any>): Promi
   const capDirName = `stepaway-${Date.now()}`;
   const apiId = sid ?? randomUUID();
 
+  // The runner's environment is decided here, before a single byte leaves the
+  // laptop: an oversized .devcontainer must fail with nothing created anywhere.
+  let renv: RunnerEnv;
+  try {
+    renv = resolveRunnerEnv(root, cfg.image);
+  } catch (e) {
+    ui.error((e as Error).message);
+    return 1;
+  }
+  if (renv.kind === "devcontainer") {
+    ui.detail(`devcontainer env ${renv.spec.hash} from ${renv.spec.files.join(", ")}`);
+  }
+
   // From the moment the session exists, any abort must take the (empty) pod
   // down with it — unless a phase explicitly disarms this finalizer.
   let armed = false;
@@ -546,6 +590,7 @@ export async function cmdPush(args: string[], flags: Record<string, any>): Promi
     excludes: excludePrefixes(cfg),
     sid,
     apiId,
+    renv,
     remote: remoteProjectPath(cfg, root),
     gitDir: remoteGitDir(root),
     target: client.server,
@@ -568,6 +613,7 @@ export async function cmdPush(args: string[], flags: Record<string, any>): Promi
     unmet: [],
     dplan: null,
     setupCmd: null,
+    environment: describeRunnerEnv(renv),
     instruction: DEFAULT_INSTRUCTION,
     manifest: null,
     report: null,

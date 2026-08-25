@@ -1,7 +1,7 @@
 {
   "name": "stepaway-monorepo",
   "private": true,
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "stepaway monorepo — packages/core (shared pure logic), cli/ (laptop client), server/ (in-cluster backend).",
   "license": "AGPL-3.0-only",
   "type": "module",

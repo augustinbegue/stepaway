@@ -85,12 +85,45 @@ That split is the durability contract, and the agent is told about it in its
 system prompt: *commit locally after each coherent unit of work — the repository
 survives crashes, the working tree does not.*
 
-The pod runs `node:22-bookworm-slim` (boot-installs git, tmux and
+By default the pod runs `node:22-bookworm-slim` (boot-installs git, tmux and
 `@anthropic-ai/claude-code`, ~1 min cold) next to a privileged `docker:dind`
-sidecar, so the project's compose stack can run on the runner.
+sidecar, so the project's compose stack can run on the runner. A project with a
+devcontainer or an explicit `image` gets that instead — see "Runner
+environment".
 
 A successful `pull` deletes both pod and PVC. `stepaway destroy` does the same
 for a handoff you want to abandon.
+
+## Runner environment
+
+What the session pod actually runs is resolved per push, first match wins:
+
+1. **`"image": "<ref>"` in `.stepaway.json`** — your image, run as-is. Nothing is
+   built; you own what is in it.
+2. **`.devcontainer/devcontainer.json`** (or a bare `.devcontainer.json`) — the
+   files under `.devcontainer/` are hashed (sha256, first 16 hex, over sorted
+   relative paths + contents) and shipped with the session-create call as a
+   ≤1 MiB tar.gz. The backend builds `stepaway-env:env-<hash>` in the cluster
+   registry with the devcontainer CLI, always merging the `stepaway` devcontainer
+   feature (claude, tmux, git, jq, bun), and boots the pod from the result.
+3. **The generic runner image** (`node:22-bookworm-slim` + boot-install).
+
+The boot script stays idempotent in all three cases (`command -v claude ||
+install`), so any image works — a prepared one is just fast.
+
+The devcontainer path needs the chart's registry component
+(`registry.enabled=true`, node-reachable via `registry.host` — see the chart's
+values). If the backend has no registry configured, push warns and falls through
+to the generic image rather than failing.
+
+A cold build is a real k8s Job: the **first** push with a given devcontainer
+config sits in state `building` for a few minutes (the CLI says so, and
+`stepaway status` shows `building`). Every later push with the same content is a
+registry cache hit and starts immediately. Change the devcontainer, get a new
+hash, pay the build once more.
+
+If the project has no devcontainer, writing one is a good first commit for the
+agent to make — it becomes the runner env from the next push on.
 
 ## What moves, and what does not
 
@@ -160,8 +193,9 @@ continue. Permission-mode probing and the commit-locally system prompt are the
 backend's defaults now, so a cluster upgrade can change them without a CLI
 release.
 
-`stepaway status` shows the backend's own run state — `pending → restoring →
-ready → running → done | failed` — which is the field to trust.
+`stepaway status` shows the backend's own run state — `[building →] pending →
+restoring → ready → running → done | failed` — which is the field to trust.
+`building` only appears on the devcontainer path, before the pod exists.
 
 `stepaway peek` renders the session transcript from `GET /v1/sessions/:id/
 transcript` — assistant prose verbatim, one `⚙ ToolName` line per tool call, no
@@ -177,6 +211,7 @@ payload dumps. `-f` follows it over SSE.
   "composeFile": "compose.yaml",
   "excludeGlobs": [],
   "setup": null,
+  "image": null,
   "env": {
     "carryFiles": [".env", ".env.local"],
     "excludeVars": ["STRIPE_LIVE_KEY"],
@@ -185,7 +220,8 @@ payload dumps. `-f` follows it over SSE.
 }
 ```
 
-`overrideVars` holds values, so stepaway never writes that key itself — only
+`image` pins the runner image and skips the devcontainer path entirely (see
+"Runner environment"). `overrideVars` holds values, so stepaway never writes that key itself — only
 `carryFiles` and `excludeVars` are remembered from the picker. Keep
 `.stepaway.json` out of git if you put secrets in `overrideVars`.
 

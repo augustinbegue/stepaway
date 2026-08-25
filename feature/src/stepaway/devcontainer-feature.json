@@ -1,0 +1,13 @@
+{
+  "id": "stepaway",
+  "version": "0.1.0",
+  "name": "stepaway runner toolchain",
+  "description": "Installs the toolchain a stepaway session expects inside a devcontainer: Claude Code, tmux, git, jq, procps, curl, unzip and bun. Usable standalone in any Debian/Ubuntu-based devcontainer.",
+  "documentationURL": "https://github.com/augustinbegue/stepaway/tree/main/feature/src/stepaway",
+  "licenseURL": "https://github.com/augustinbegue/stepaway/blob/main/LICENSE",
+  "options": {},
+  "installsAfter": [
+    "ghcr.io/devcontainers/features/common-utils",
+    "ghcr.io/devcontainers/features/node"
+  ]
+}

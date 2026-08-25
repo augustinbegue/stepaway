@@ -2,8 +2,8 @@ apiVersion: v2
 name: stepaway
 description: Hand off a live Claude Code session between machines via a k8s-backed runner.
 type: application
-version: 0.1.1
-appVersion: "0.3.1"
+version: 0.2.0
+appVersion: "0.4.0"
 home: https://stepaway.dev
 sources:
   - https://github.com/augustinbegue/stepaway
@@ -13,3 +13,18 @@ keywords:
   - session-handoff
 annotations:
   licenses: AGPL-3.0
+dependencies:
+  # In-cluster OCI registry for devcontainer env images (SPEC-v0.3). Aliased to
+  # `registry` so the whole subchart values surface lives under `registry.*`.
+  # Off by default: the devcontainer build path is opt-in.
+  #
+  # NOTE: the tarball is vendored in charts/ because helm.twun.io (the chart
+  # repo the upstream README advertises) currently does not resolve; the
+  # tarball is the official docker-registry-3.0.0.tgz release asset from
+  # https://github.com/twuni/docker-registry.helm/releases/tag/v3.0.0.
+  # `helm dependency update` will re-fetch it once the repo host is back.
+  - name: docker-registry
+    alias: registry
+    version: 3.0.0
+    repository: https://helm.twun.io
+    condition: registry.enabled

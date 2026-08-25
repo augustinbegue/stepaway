@@ -35,6 +35,30 @@ not enforce them — verify your cluster's CNI actually enforces
 NetworkPolicy before relying on this for isolation between sessions.
 {{- end }}
 
+{{- if .Values.registry.enabled }}
+
+Registry (devcontainer environments) is ENABLED:
+
+  host:    {{ .Values.registry.host }}
+  storage: {{ if .Values.registry.persistence.enabled }}PVC {{ .Values.registry.persistence.size }}{{ if .Values.registry.persistence.storageClass }} ({{ .Values.registry.persistence.storageClass }}){{ end }}{{ else }}emptyDir (NOT persistent — images are lost on restart){{ end }}
+
+Sessions whose repo has a .devcontainer/devcontainer.json now run in an image
+built from it (plus the stepaway feature), cached in this registry under
+{{ .Values.registry.host }}/stepaway-env:env-<hash>.
+
+  - {{ .Values.registry.host }} MUST resolve and be reachable *from your
+    nodes*: the kubelet pulls the session image, and kubelets do not use
+    cluster DNS. Point that name at your ingress controller and give it a
+    valid TLS certificate ({{ if .Values.registry.expose.tls.secretName }}using Secret {{ .Values.registry.expose.tls.secretName }}{{ else }}registry.expose.tls.secretName is EMPTY — pushes and pulls will fail until you set it{{ end }}).
+  - First push with a given devcontainer config is slow (a full image build,
+    typically 2-10 minutes; the session sits in state "building"). Every later
+    session with the same config starts from the cache in seconds.
+  - Credentials: kubectl get secret {{ .Values.registry.auth.secretName }} -n {{ .Release.Namespace }} -o jsonpath='{.data.password}' | base64 -d; echo
+    (user "stepaway"; pull secret for session pods: {{ .Values.registry.pullSecretName }})
+  - Garbage collection is a manual op:
+    kubectl exec -n {{ .Release.Namespace }} deploy/{{ include "stepaway.registryFullname" . }} -- registry garbage-collect --delete-untagged /etc/distribution/config.yml
+{{- end }}
+
 {{- if or .Values.quotas.enabled .Values.limitRange.enabled }}
 
 Governance enabled:

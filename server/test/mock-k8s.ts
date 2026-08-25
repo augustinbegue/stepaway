@@ -4,7 +4,7 @@
  * doubles as an assertion that the route ran the command we think it did.
  */
 
-import type { ExecOpts, ExecResult, K8s, PodObject, StorageClassProbe } from "../src/k8s.js";
+import type { ExecOpts, ExecResult, JobObject, K8s, PodObject, PvcObject, StorageClassProbe } from "../src/k8s.js";
 
 export type ExecCall = { pod: string; command: string[]; script: string; stdinBytes: number; opts: ExecOpts };
 /** Return an Error to make the exec *throw* (timeout / socket drop). */
@@ -13,8 +13,14 @@ export type ExecHandler = (call: ExecCall) => Partial<ExecResult> | string | Err
 export class MockK8s implements K8s {
   readonly namespace = "stepaway-test";
   pods = new Map<string, PodObject>();
-  pvcs = new Set<string>();
+  /**
+   * PVCs are objects, not names: SPEC-v0.3 parks a `building` session's
+   * annotations on the PVC because its pod does not exist yet.
+   */
+  pvcObjects = new Map<string, PvcObject>();
+  jobs = new Map<string, JobObject>();
   secrets = new Map<string, Record<string, string>>();
+  podLogsByPod = new Map<string, string>();
   created: { kind: string; yaml: string }[] = [];
   deleted: string[] = [];
   execs: ExecCall[] = [];
@@ -34,7 +40,15 @@ export class MockK8s implements K8s {
   async createFromYaml(kindPlural: "pods" | "persistentvolumeclaims", yaml: string): Promise<void> {
     this.created.push({ kind: kindPlural, yaml });
     if (kindPlural === "persistentvolumeclaims") {
-      this.pvcs.add(nameFromYaml(yaml));
+      const pvcName = nameFromYaml(yaml);
+      this.pvcObjects.set(pvcName, {
+        metadata: {
+          name: pvcName,
+          labels: labelsFromYaml(yaml),
+          annotations: annotationsFromYaml(yaml),
+          creationTimestamp: new Date().toISOString(),
+        },
+      });
       return;
     }
     const name = nameFromYaml(yaml);
@@ -53,19 +67,14 @@ export class MockK8s implements K8s {
     return this.pods.get(name) ?? null;
   }
 
-  async listPods(): Promise<PodObject[]> {
-    return [...this.pods.values()];
+  async listPods(labelSelector?: string): Promise<PodObject[]> {
+    return [...this.pods.values()].filter((p) => matches(p.metadata.labels, labelSelector));
   }
 
   async patchPodAnnotations(name: string, annotations: Record<string, string | null>): Promise<void> {
     const pod = this.pods.get(name);
     if (!pod) return;
-    const ann = { ...(pod.metadata.annotations ?? {}) };
-    for (const [k, v] of Object.entries(annotations)) {
-      if (v === null) delete ann[k];
-      else ann[k] = v;
-    }
-    pod.metadata.annotations = ann;
+    pod.metadata.annotations = mergeAnnotations(pod.metadata.annotations, annotations);
   }
 
   async deletePod(name: string): Promise<void> {
@@ -74,8 +83,49 @@ export class MockK8s implements K8s {
   }
 
   async deletePvc(name: string): Promise<void> {
-    this.pvcs.delete(name);
+    this.pvcObjects.delete(name);
     this.deleted.push(`pvc/${name}`);
+  }
+
+  async getPvc(name: string): Promise<PvcObject | null> {
+    return this.pvcObjects.get(name) ?? null;
+  }
+
+  async listPvcs(labelSelector?: string): Promise<PvcObject[]> {
+    return [...this.pvcObjects.values()].filter((p) => matches(p.metadata.labels, labelSelector));
+  }
+
+  async patchPvcAnnotations(name: string, annotations: Record<string, string | null>): Promise<void> {
+    const pvc = this.pvcObjects.get(name);
+    if (!pvc) return;
+    pvc.metadata.annotations = mergeAnnotations(pvc.metadata.annotations, annotations);
+  }
+
+  async createJobFromYaml(yaml: string): Promise<void> {
+    this.created.push({ kind: "jobs", yaml });
+    const name = nameFromYaml(yaml);
+    if (this.jobs.has(name)) return; // 409, idempotent by construction
+    this.jobs.set(name, {
+      metadata: { name, labels: labelsFromYaml(yaml), creationTimestamp: new Date().toISOString() },
+      status: { active: 1 },
+    });
+  }
+
+  async getJob(name: string): Promise<JobObject | null> {
+    return this.jobs.get(name) ?? null;
+  }
+
+  async listJobs(labelSelector?: string): Promise<JobObject[]> {
+    return [...this.jobs.values()].filter((j) => matches(j.metadata.labels, labelSelector));
+  }
+
+  async deleteJob(name: string): Promise<void> {
+    this.jobs.delete(name);
+    this.deleted.push(`job/${name}`);
+  }
+
+  async podLogs(name: string): Promise<string> {
+    return this.podLogsByPod.get(name) ?? "";
   }
 
   async getSecret(name: string): Promise<Record<string, string> | null> {
@@ -84,6 +134,11 @@ export class MockK8s implements K8s {
 
   async applySecret(name: string, data: Record<string, string>): Promise<void> {
     this.secrets.set(name, data);
+  }
+
+  async deleteSecret(name: string): Promise<void> {
+    this.secrets.delete(name);
+    this.deleted.push(`secret/${name}`);
   }
 
   async listStorageClasses(): Promise<StorageClassProbe> {
@@ -128,6 +183,28 @@ export class MockK8s implements K8s {
       },
     });
   }
+}
+
+function mergeAnnotations(
+  current: Record<string, string> | undefined,
+  patch: Record<string, string | null>,
+): Record<string, string> {
+  const ann = { ...(current ?? {}) };
+  for (const [k, v] of Object.entries(patch)) {
+    if (v === null) delete ann[k];
+    else ann[k] = v;
+  }
+  return ann;
+}
+
+/** `k=v` and bare-`k` (exists) selectors — the only two forms the server uses. */
+function matches(labels: Record<string, string> | undefined, selector?: string): boolean {
+  if (!selector) return true;
+  return selector.split(",").every((term) => {
+    const [k, v] = term.split("=");
+    const have = labels?.[k.trim()];
+    return v === undefined ? have !== undefined : have === v.trim();
+  });
 }
 
 async function drain(stdin: ExecOpts["stdin"]): Promise<number> {
@@ -182,6 +259,18 @@ function annotationsFromYaml(yaml: string): Record<string, string> {
     }
   }
   return out;
+}
+
+/** A PVC as the API server would report it (the pre-pod home of session state). */
+export function fakePvc(o: { name: string; sessionId: string; annotations?: Record<string, string> }): PvcObject {
+  return {
+    metadata: {
+      name: o.name,
+      labels: { "stepaway.dev/session": o.sessionId },
+      annotations: o.annotations,
+      creationTimestamp: "2026-08-24T10:00:00.000Z",
+    },
+  };
 }
 
 /** A pod as the API server would report it once the kubelet has it running. */

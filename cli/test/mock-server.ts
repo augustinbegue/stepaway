@@ -23,8 +23,19 @@ export type Mock = {
 
 const TOKEN = "t";
 
-export function startMock(o: { version?: string; transcript?: string; readyAfter?: number } = {}): Promise<Mock> {
+export function startMock(
+  o: {
+    version?: string;
+    transcript?: string;
+    readyAfter?: number;
+    /** v1.2: how many polls a session with an envSpec spends in `building`. */
+    buildPolls?: number;
+    /** v1.2: pretend the backend has no registry — warn and fall through. */
+    noRegistry?: boolean;
+  } = {},
+): Promise<Mock> {
   const version = o.version ?? "0.3.0";
+  const building = new Map<string, number>();
   const calls: Call[] = [];
   const sessions = new Map<string, Session>();
   const captures = new Map<string, Uint8Array>();
@@ -86,13 +97,19 @@ export function startMock(o: { version?: string; transcript?: string; readyAfter
       if (p === ROUTES.sessions) {
         if (req.method === "POST") {
           const body: any = await req.json();
+          const wantsBuild = Boolean(body.envSpec) && !o.noRegistry && (o.buildPolls ?? 0) > 0;
           const s: Session = {
             id: body.sessionId,
             project: body.project,
-            state: "pending",
-            podName: `stepaway-${String(body.sessionId).slice(0, 8)}`,
+            state: wantsBuild ? "building" : "pending",
+            // no pod exists while the env image is still being built
+            podName: wantsBuild ? "" : `stepaway-${String(body.sessionId).slice(0, 8)}`,
             createdAt: new Date().toISOString(),
           };
+          if (wantsBuild) building.set(s.id, o.buildPolls!);
+          if (body.envSpec && o.noRegistry) {
+            s.detail = "no registry configured on this backend; using the generic runner image";
+          }
           sessions.set(s.id, s);
           calls.push({ method: "POST", path: p, query, body });
           return json(s, 201);
@@ -112,6 +129,17 @@ export function startMock(o: { version?: string; transcript?: string; readyAfter
           const n = (polls.get(id) ?? 0) + 1;
           polls.set(id, n);
           if (s!.state === "pending" && n >= readyAfter) s!.state = "ready";
+          // building → pending happens *after* the readiness check, so a client
+          // observes every state edge (building…, pending, ready) in order
+          if (s!.state === "building") {
+            const left = (building.get(id) ?? 0) - 1;
+            building.set(id, left);
+            if (left <= 0) {
+              s!.state = "pending";
+              s!.podName = `stepaway-${id.slice(0, 8)}`;
+              polls.set(id, 0); // the pending clock starts when the pod does
+            }
+          }
           calls.push({ method: "GET", path: p, query });
           return json(s);
         }

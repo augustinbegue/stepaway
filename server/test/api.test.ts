@@ -23,7 +23,7 @@ import {
 import { createApp, launchScript, transcriptPath } from "../src/app.js";
 import { VERSION, loadConfig } from "../src/config.js";
 import { ANN } from "../src/sessions.js";
-import { MockK8s, fakePod } from "./mock-k8s.js";
+import { MockK8s, fakePod, fakePvc } from "./mock-k8s.js";
 
 const TOKEN = "test-token-0123456789";
 const SID = "0ea9f8b7-1111-2222-3333-444455556666";
@@ -168,7 +168,7 @@ describe("sessions", () => {
 
   test("delete removes pod and PVC", async () => {
     const k8s = new MockK8s({ pods: [ready({ ...BASE_ANN, [ANN.state]: "ready" })] });
-    k8s.pvcs.add(POD);
+    k8s.pvcObjects.set(POD, fakePvc({ name: POD, sessionId: SID }));
     const res = await app(k8s).fetch(req(ROUTES.session(SID), { method: "DELETE" }));
     expect(res.status).toBe(200);
     expect(k8s.deleted).toEqual([`pod/${POD}`, `pvc/${POD}`]);

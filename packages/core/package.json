@@ -1,6 +1,6 @@
 {
   "name": "@stepaway/core",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Pure shared logic for stepaway: transcript reader, manifest/config types, podspec template, capture/restore scripts.",
   "license": "AGPL-3.0-only",
   "private": true,

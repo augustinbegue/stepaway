@@ -7,6 +7,7 @@
  * with a fake HOME, asserting on both the CLI's output and what the mock
  * actually received (session create, gzip'd capture bytes, run call, baton).
  */
+import { createHash, randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -73,6 +74,39 @@ function fixture() {
 }
 
 const gzip = (b: Uint8Array) => b.length > 2 && b[0] === 0x1f && b[1] === 0x8b;
+
+/**
+ * A second, third… throwaway git project under ROOT. Used by the v0.3 env
+ * resolution tests, which each need a differently-shaped repo.
+ */
+function project(name: string, files: Record<string, string | Buffer>): string {
+  const dir = path.join(ROOT, name);
+  fs.mkdirSync(dir, { recursive: true });
+  for (const [rel, body] of Object.entries(files)) {
+    fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
+    fs.writeFileSync(path.join(dir, rel), body);
+  }
+  sh("git init -q -b main . && git config user.email t@t && git config user.name t && git add -A && git commit -qm init", dir);
+  return dir;
+}
+
+/**
+ * The envHash contract, reimplemented from the spec text rather than imported:
+ * sha256 over `path \0 bytes \0` in sorted path order, first 16 hex. If the CLI
+ * ever drifts from the written rule, this disagrees.
+ */
+function expectedEnvHash(dir: string, rels: string[]): string {
+  const h = createHash("sha256");
+  for (const rel of [...rels].sort()) {
+    h.update(rel, "utf8");
+    h.update("\0");
+    h.update(fs.readFileSync(path.join(dir, rel)));
+    h.update("\0");
+  }
+  return h.digest("hex").slice(0, 16);
+}
+
+const DEVCONTAINER = JSON.stringify({ name: "fixture", image: "mcr.microsoft.com/devcontainers/base:bookworm" }, null, 2);
 
 async function main() {
   fixture();
@@ -176,6 +210,94 @@ async function main() {
   check("doctor has no kubectl check", !/kubectl/i.test(doctor.out + doctor.err));
   const wrongToken = await cli(["status", "--server", mock.url, "--server-token", "nope"], { cwd: ROOT });
   check("401 surfaces the JSON error", /unauthorized/.test(wrongToken.out + wrongToken.err), (wrongToken.err || wrongToken.out).trim().split("\n")[0]);
+
+  // ------------------------------------- v0.3 runner environment resolution
+  // one backend that builds env images, and three differently-shaped projects
+  const envMock = await startMock({ buildPolls: 2 });
+  const E = ["--server", envMock.url, "--server-token", "t"];
+
+  // (a) devcontainer only → envSpec travels, and the build is waited out
+  const devFiles = { ".devcontainer/devcontainer.json": DEVCONTAINER, ".devcontainer/Dockerfile": "FROM debian:bookworm\n" };
+  const devProj = project("dev", devFiles);
+  const devPush = await cli(["push", "--yes", "--verbose", ...E], { cwd: devProj });
+  check("push with a devcontainer exits 0", devPush.code === 0, devPush.err.trim().split("\n").slice(-2).join(" | "));
+  const devCreate = envMock.calls.find((c) => c.method === "POST" && c.path === "/v1/sessions" && c.body?.envSpec);
+  const wantHash = expectedEnvHash(devProj, Object.keys(devFiles));
+  check("create carries envSpec with the spec'd hash", devCreate?.body?.envSpec?.hash === wantHash, `${devCreate?.body?.envSpec?.hash} vs ${wantHash}`);
+  const tgz = devCreate?.body?.envSpec?.filesTgz ? Buffer.from(devCreate.body.envSpec.filesTgz, "base64") : new Uint8Array();
+  check("envSpec.filesTgz is base64 gzip", gzip(tgz) && tgz.length > 0, `${tgz.length} bytes`);
+  check(
+    "envSpec tar holds the .devcontainer paths",
+    (() => {
+      const p = path.join(ROOT, "spec.tgz");
+      fs.writeFileSync(p, tgz);
+      const listed = sh(`tar tzf ${p}`, ROOT);
+      return listed.includes(".devcontainer/devcontainer.json") && listed.includes(".devcontainer/Dockerfile");
+    })(),
+  );
+  check("no image option when a devcontainer decides it", devCreate?.body?.options?.image === undefined);
+  check(
+    "consent summary names the devcontainer environment",
+    (devPush.out + devPush.err).includes(`devcontainer (hash ${wantHash}, built+cached on the runner)`),
+  );
+  check(
+    "building is a non-terminal state with its own message",
+    (devPush.out + devPush.err).includes("building devcontainer env image"),
+  );
+
+  // (b) explicit image in .stepaway.json wins over the devcontainer
+  const imgProj = project("img", {
+    ...devFiles,
+    ".stepaway.json": JSON.stringify({ image: "ghcr.io/me/env:v1" }, null, 2),
+  });
+  const imgPush = await cli(["push", "--yes", ...E], { cwd: imgProj });
+  check("push with an explicit image exits 0", imgPush.code === 0, imgPush.err.trim().split("\n").slice(-2).join(" | "));
+  const imgCreate = envMock.calls.find((c) => c.method === "POST" && c.path === "/v1/sessions" && c.body?.options?.image);
+  check("explicit image beats the devcontainer", imgCreate?.body?.options?.image === "ghcr.io/me/env:v1" && imgCreate?.body?.envSpec === undefined, JSON.stringify(imgCreate?.body?.options));
+  check(
+    "consent summary names the explicit image",
+    (imgPush.out + imgPush.err).includes("image ghcr.io/me/env:v1 (explicit)"),
+  );
+
+  // (c) neither → nothing new on the wire, generic runner image
+  const plainProj = project("plain", { "README.md": "# plain\n" });
+  const plainPush = await cli(["push", "--yes", ...E], { cwd: plainProj });
+  check("push with no env config exits 0", plainPush.code === 0, plainPush.err.trim().split("\n").slice(-2).join(" | "));
+  const plainCreate = envMock.calls.filter((c) => c.method === "POST" && c.path === "/v1/sessions").pop();
+  check(
+    "no envSpec and no image when the project declares neither",
+    plainCreate?.body?.envSpec === undefined && plainCreate?.body?.options?.image === undefined,
+    JSON.stringify(plainCreate?.body),
+  );
+  check("consent summary falls back to the generic image", (plainPush.out + plainPush.err).includes("generic runner image"));
+
+  // (d) an oversized .devcontainer fails before a single byte leaves the laptop
+  const fatProj = project("fat", {
+    ".devcontainer/devcontainer.json": DEVCONTAINER,
+    // incompressible, so gzip cannot rescue it
+    ".devcontainer/blob.bin": randomBytes(2 * 1024 * 1024),
+  });
+  const callsBefore = envMock.calls.length;
+  const fatPush = await cli(["push", "--yes", ...E], { cwd: fatProj });
+  check("oversized devcontainer refuses the push", fatPush.code === 1, (fatPush.err || fatPush.out).trim().split("\n").slice(-1)[0]);
+  check(
+    "the size limit error names the offending size",
+    /too large to ship: [\d.]+ MiB of base64 tar\.gz \(limit 1\.00 MiB/.test(fatPush.err + fatPush.out),
+    (fatPush.err + fatPush.out).trim().split("\n").slice(-1)[0],
+  );
+  check("oversized devcontainer made no network call at all", envMock.calls.length === callsBefore, `${envMock.calls.length - callsBefore} call(s)`);
+  envMock.stop();
+
+  // (e) a backend with no registry: warn, fall through, still succeed
+  const noReg = await startMock({ noRegistry: true });
+  const fallback = await cli(["push", "--yes", "--server", noReg.url, "--server-token", "t"], { cwd: devProj });
+  check("push survives a backend with no registry", fallback.code === 0, fallback.err.trim().split("\n").slice(-2).join(" | "));
+  check(
+    "the ignored-envSpec warning is surfaced",
+    /devcontainer env not used: no registry configured/.test(fallback.err + fallback.out),
+    (fallback.err || fallback.out).trim().split("\n").slice(-1)[0],
+  );
+  noReg.stop();
 
   // major skew must hard-fail
   const skewed = await startMock({ version: "9.0.0" });
